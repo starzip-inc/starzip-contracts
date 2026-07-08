@@ -1,0 +1,37 @@
+{
+  "name": "starzip-contracts",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "StarZip smart contracts — audit package",
+  "overrides": {
+    "tmp": "0.2.3"
+  },
+  "scripts": {
+    "compile": "hardhat compile",
+    "test": "hardhat test",
+    "lint": "solhint 'contracts/**/*.sol'",
+    "lint:fix": "solhint 'contracts/**/*.sol' --fix",
+    "format": "prettier --write \"**/*.{sol,ts,js,json,md}\"",
+    "format:check": "prettier --check \"**/*.{sol,ts,js,json,md}\"",
+    "typecheck": "tsc --noEmit",
+    "node": "hardhat node",
+    "clean": "hardhat clean"
+  },
+  "devDependencies": {
+    "@account-abstraction/contracts": "0.8.0",
+    "@nomicfoundation/hardhat-toolbox-viem": "^5.0.1",
+    "@nomicfoundation/hardhat-viem": "^3.0.0",
+    "@openzeppelin/contracts": "^5.5.0",
+    "@openzeppelin/contracts-upgradeable": "^5.5.0",
+    "dotenv": "^16.4.7",
+    "hardhat": "^3.1.0",
+    "prettier": "^3.3.3",
+    "prettier-plugin-solidity": "^1.4.1",
+    "solhint": "^5.0.3",
+    "typescript": "^5.7.2",
+    "viem": "^2.43.1"
+  },
+  "dependencies": {
+    "@nomicfoundation/hardhat-ignition": "^3.0.6"
+  }
+}
