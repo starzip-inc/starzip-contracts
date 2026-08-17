@@ -3,6 +3,7 @@ pragma solidity 0.8.30;
 
 import { ERC20Upgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC20/ERC20Upgradeable.sol";
 import { ERC20PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PausableUpgradeable.sol";
+import { ERC20PermitUpgradeable } from "@openzeppelin/contracts-upgradeable/token/ERC20/extensions/ERC20PermitUpgradeable.sol";
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
 import { Ownable2StepUpgradeable } from "@openzeppelin/contracts-upgradeable/access/Ownable2StepUpgradeable.sol";
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
@@ -13,7 +14,11 @@ import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils
  * @dev UUPS upgradeable ERC20 with blacklist and max supply features
  *
  * Features:
- * - Pausable transfers
+ * - Pausable transfers (user<->user only — platform legs are exempt, see `_update`)
+ * - EIP-2612 `permit`, so a gasless first deposit into TradeSettlement is possible at all:
+ *   `depositToken` is sponsorable but the `approve` preceding it is a call to THIS token, outside
+ *   any paymaster policy scoped to the settlement contract, so a user with zero native balance was
+ *   previously unable to make a first deposit. See `initialize` for the storage-layout argument.
  * - Blacklist functionality
  * - Max supply limit (optional)
  * - Burn capability
@@ -28,6 +33,7 @@ contract ERC20V1 is
     Initializable,
     ERC20Upgradeable,
     ERC20PausableUpgradeable,
+    ERC20PermitUpgradeable,
     Ownable2StepUpgradeable,
     UUPSUpgradeable
 {
@@ -86,6 +92,24 @@ contract ERC20V1 is
      * @param _name Token name
      * @param _symbol Token symbol
      * @param _contractURI Contract metadata URI
+     *
+     * @dev STORAGE-LAYOUT ARGUMENT for adding ERC20Permit to a BEACON-PROXY token (this change
+     *      applies to EVERY token ever issued from the beacon at once, so it must not shift a
+     *      single slot). It does not, and the reason is structural rather than incidental:
+     *      `ERC20PermitUpgradeable` declares NO state of its own; its two stateful bases,
+     *      `EIP712Upgradeable` and `NoncesUpgradeable`, both use ERC-7201 namespaced storage
+     *      (`erc7201:openzeppelin.storage.EIP712` at
+     *      0xa16a46d94261c7517cc8ff89f61c0ce93598e3c849801011dee649a6a557d100 and
+     *      `erc7201:openzeppelin.storage.Nonces` at
+     *      0x5ab42ced628888259c08ac98db1eb0cf702fc1501344311d8b100cd1bfe4bb00, verified in the
+     *      installed OpenZeppelin contracts-upgradeable 5.5.0). Those are hash-derived slots, not
+     *      sequential ones, so this contract's own variables (`contractURI` .. `blacklist`) and
+     *      `__gap` keep their slot numbers and `__gap` does NOT shrink — confirmed against the
+     *      compiled `storageLayout` artifact, not assumed.
+     *
+     *      `__ERC20Permit_init(_name)` only sets the EIP-712 domain. Note the domain binds the
+     *      token NAME, so the name is now signature-relevant; it is immutable here (no rename
+     *      path exists), so no already-signed permit can be invalidated by a later name change.
      */
     function initialize(
         address initialOwner,
@@ -99,6 +123,7 @@ contract ERC20V1 is
 
         __ERC20_init(_name, _symbol);
         __ERC20Pausable_init();
+        __ERC20Permit_init(_name);
         __Ownable_init(initialOwner);
 
         contractURI = _contractURI;
@@ -260,6 +285,12 @@ contract ERC20V1 is
 
     // ============ Pausable Functions ============
 
+    /**
+     * @notice Halt ordinary user<->user transfers.
+     * @dev NOT a protocol-wide freeze. Legs to/from registered StarZip platform
+     *      contracts (settlement withdrawals/deposits, launchpad claims, vesting releases) and
+     *      mints keep executing while paused — see `_update`.
+     */
     function pause() public onlyOwner {
         _pause();
     }
@@ -326,12 +357,71 @@ contract ERC20V1 is
     }
 
     /**
-     * @dev Consult the registry only when a blacklist entry would otherwise block (hot path
-     *      stays at 2 SLOADs). Platform-originated legs (from == infra, or a mint) bypass blacklist
-     *      so a business cannot grief claims / vesting releases / settlement withdrawals, nor block
-     *      a blacklisted investor from RECEIVING a distribution. Ordinary user<->user transfers and
-     *      user->platform deposits (to is platform, from an ordinary user) remain under the
-     *      business blacklist.
+     * @dev Transfer gate with two INDEPENDENT carve-outs for platform rails. They are
+     *      deliberately different widths — do not merge them.
+     *
+     *      BLACKLIST (FROM-side only). Consult the registry only when a blacklist entry
+     *      would otherwise block (hot path stays at 2 SLOADs). Platform-originated legs
+     *      (from == infra, or a mint) bypass the blacklist so a business cannot grief claims /
+     *      vesting releases / settlement withdrawals, nor block a blacklisted investor from
+     *      RECEIVING a distribution. Ordinary user<->user transfers and user->platform deposits
+     *      (to is platform, from an ordinary user) remain under the business blacklist: a
+     *      blacklisted holder must not be able to push value back INTO the exchange and trade it.
+     *
+     *      PAUSE (FROM-side only — deliberately NARROWER than it looks like it
+     *      "should" be). Only an OUTBOUND leg from platform infra executes while paused: a mint
+     *      (from == 0) or a platform-originated payout (`_isPlatform(from)`). A deposit INTO
+     *      platform infra (`_isPlatform(to)`) is NOT exempt and reverts with `EnforcedPause()`
+     *      like any other transfer.
+     *
+     *      WHY: `pause()` is the business owner's key, and TradeSettlement holds user-deposited
+     *      tokens non-custodially. Without this carve-out a business owner pausing its own token
+     *      bricks `withdrawToken` / `batchWithdraw` with `EnforcedPause()` — and the owner backstop
+     *      `emergencyWithdrawFor` with it — while `settleOrders` (balance-only, no external calls)
+     *      keeps matching. Users would go on buying ledger claims against an asset nobody can
+     *      redeem. The non-custodial withdrawal guarantee must not be defeatable one layer down at
+     *      the token. This mirrors the blacklist carve-out, where the same owner key is already denied the ability to
+     *      block platform legs via the blacklist; pause simply had no counterpart.
+     *
+     *      WHY THE `to` SIDE IS NOT EXEMPT: every leg this carve-out exists to protect is
+     *      outbound — `withdrawToken`, `batchWithdraw`, `emergencyWithdrawFor`, launchpad claims,
+     *      vesting releases — so `_isPlatform(from)` already covers all of them. Exempting `to` as
+     *      well bought nothing and re-opened the exchange as a laundering route: with the token
+     *      paused, a thief could still `depositToken` stolen supply into TradeSettlement, have
+     *      `settleOrders` (balance-only, pause-blind) fill it, cash out in USDT, and leave the
+     *      buyer to `withdrawToken` the stolen paused token back out. Pause would have stopped
+     *      the theft from moving anywhere else while doing nothing about the one venue with real
+     *      liquidity. FROM-side-only restores containment: no new stolen supply can ENTER the
+     *      exchange while paused, so the settlement ledger cannot grow new claims against the
+     *      paused token, and the exemption drains the escrow rather than feeding it.
+     *
+     *      WHAT IS STILL BYPASSED: platform-ORIGINATED transfers (`_isPlatform(from)`) and mints.
+     *      A business owner cannot freeze withdrawals out of StarZip platform contracts, cannot
+     *      freeze launchpad claims or vesting releases, and cannot block a mint. Tokens already
+     *      inside platform escrow when `pause()` is pressed remain fully redeemable — including by
+     *      a holder the owner also blacklisted (the FROM-side bypass).
+     *
+     *      WHAT IS BLOCKED AGAIN: every INBOUND leg. Deposits into TradeSettlement, escrow
+     *      funding of a launchpad, and any other user -> platform transfer revert while paused,
+     *      exactly like user<->user transfers. `pause()` is therefore a one-way valve: value can
+     *      leave platform rails but no new value can enter them.
+     *
+     *      WHAT IS STILL GIVEN UP: pause is not a total freeze. It cannot claw back or immobilise
+     *      balances already held by platform contracts, and holders of those balances can exit
+     *      while paused. `pause()` is an inbound-and-secondary-market switch, not a protocol-wide
+     *      kill switch.
+     *
+     *      LINEARIZATION (OZ contracts-upgradeable 5.5.0): C3 for `_update` is
+     *      ERC20V1 -> ERC20PausableUpgradeable -> ERC20Upgradeable. `PausableUpgradeable`,
+     *      `Ownable2StepUpgradeable`, `UUPSUpgradeable` and
+     *      `ERC20PermitUpgradeable` (whose only bases beyond ERC20 are EIP712/Nonces) define no
+     *      `_update`, so the override set below is still exactly those two bases and
+     *      `ERC20PausableUpgradeable._update` contributes exactly one thing — the `whenNotPaused`
+     *      modifier — before delegating to `ERC20Upgradeable._update`, which holds the entire
+     *      balance/supply accounting and the `Transfer` event. Calling `ERC20Upgradeable._update`
+     *      explicitly therefore skips the pause check and NOTHING else; no hook is bypassed.
+     *      `paused()` is read first so the registry is touched only while paused — the unpaused
+     *      hot path is unchanged apart from one warm SLOAD.
      */
     function _update(
         address from,
@@ -344,6 +434,12 @@ contract ERC20V1 is
                 if (blacklist[to]) revert AccountBlacklisted();
             }
         }
+
+        if (paused() && (from == address(0) || _isPlatform(from))) {
+            ERC20Upgradeable._update(from, to, value);
+            return;
+        }
+
         super._update(from, to, value);
     }
 

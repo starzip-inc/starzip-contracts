@@ -1,7 +1,8 @@
 /**
- * StarzipWallet v1 (social-recovery, self-owned) tests.
- * Admin actions are `onlySelf`: privileged ops must arrive as passkey-signed userOps routed
- * EntryPoint -> execute -> address(this). No EOA owner authority (owner is an inert sentinel).
+ * StarzipWallet v2 (Coinbase-Smart-Wallet-style multi-owner) tests.
+ * Admin actions are `onlySelf`: privileged ops must arrive as an owner-signed userOp routed
+ * EntryPoint -> execute -> address(this). No EOA/operator authority outside the registered owner
+ * set — see StarzipWallet.sol's contract-level NatSpec for the design.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert";
@@ -15,8 +16,21 @@ import {
   type Hex,
   type Address,
 } from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { loadFixture, getConnection, time, assertions } from "./helpers.js";
-import { passkeyPubCoords, webauthnSignature, buildUserOp, execViaPasskey } from "./aa-helpers.js";
+import {
+  passkeyPubCoords,
+  webauthnSignature,
+  buildUserOp,
+  execViaPasskey,
+  encodeAddressOwner,
+  encodePasskeyOwner,
+  encodeSignatureWrapper,
+} from "./aa-helpers.js";
+
+// Deterministic secp256k1 test key (Hardhat account #0's well-known private key — used elsewhere
+// in this suite, e.g. TokenFactory's permitSigner) for the EOA-style owner test.
+const EOA_OWNER_PRIV = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80" as Hex;
 
 // Deterministic P-256 test keys (NOT for production). Scalars < n.
 const PASSKEY_PRIV = hexToBytes(
@@ -34,8 +48,6 @@ const { x: NEW_PK_X, y: NEW_PK_Y } = passkeyPubCoords(NEW_PASSKEY_PRIV);
 const OFFCURVE_X = NEW_PK_X;
 const OFFCURVE_Y = PK_Y;
 
-// Inert owner sentinel (must be a non-zero deterministic value; 0xdEaD recommended).
-const OWNER_SENTINEL = "0x000000000000000000000000000000000000dEaD" as Address;
 const ZERO_BYTES32 = "0x0000000000000000000000000000000000000000000000000000000000000000" as Hex;
 const SALT = 100n;
 const UPGRADE_TIMELOCK = 48n * 60n * 60n;
@@ -50,10 +62,11 @@ async function deployFixture() {
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
   const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
 
-  await factory.write.createAccount([PK_X, PK_Y, OWNER_SENTINEL, SALT], {
+  const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
+  await factory.write.createAccount([[firstOwner], SALT], {
     account: deployer.account,
   });
-  const walletAddr = (await factory.read.getAddress([PK_X, PK_Y, OWNER_SENTINEL, SALT])) as Address;
+  const walletAddr = (await factory.read.getAddress([[firstOwner], SALT])) as Address;
   const account = await viem.getContractAt("StarzipWallet", walletAddr);
 
   // prefund so the wallet can pay EntryPoint prefund
@@ -81,7 +94,7 @@ function opSucceeded(receipt: any, entryPointAbi: any): boolean {
   return ev.length > 0 && (ev[0] as any).args.success === true;
 }
 
-// Route an inner self-call (e.g. changePasskey) through the passkey + EntryPoint.
+// Route an inner self-call (e.g. addOwnerPublicKey) through owner index 0's passkey + EntryPoint.
 async function selfCall(ctx: any, innerCalldata: Hex, priv: Uint8Array = PASSKEY_PRIV) {
   return execViaPasskey({
     publicClient: ctx.publicClient,
@@ -96,55 +109,48 @@ async function selfCall(ctx: any, innerCalldata: Hex, priv: Uint8Array = PASSKEY
   });
 }
 
-describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
+describe("StarzipWallet v2 (multi-owner)", function () {
   // ============ Initialization ============
   describe("Initialization", function () {
-    it("stores passkey coords and inert owner sentinel", async function () {
+    it("registers the first owner at index 0", async function () {
       const { account } = await loadFixture(deployFixture);
-      assert.strictEqual(await account.read.publicKeyX(), PK_X);
-      assert.strictEqual(await account.read.publicKeyY(), PK_Y);
-      assert.strictEqual(
-        getAddress((await account.read.owner()) as string),
-        getAddress(OWNER_SENTINEL),
-      );
+      assert.strictEqual(await account.read.ownerAtIndex([0n]), encodePasskeyOwner(PK_X, PK_Y));
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 1n);
+      assert.strictEqual((await account.read.nextOwnerIndex()) as bigint, 1n);
+      assert.strictEqual(await account.read.isOwnerBytes([encodePasskeyOwner(PK_X, PK_Y)]), true);
     });
 
-    it("reserves social-recovery storage at zero (recovery disabled)", async function () {
-      const { account } = await loadFixture(deployFixture);
-      assert.strictEqual(await account.read.guardianSetRoot(), ZERO_BYTES32);
-      assert.strictEqual((await account.read.guardianThreshold()) as bigint, 0n);
-      assert.strictEqual((await account.read.recoveryRequestedAt()) as bigint, 0n);
-      assert.strictEqual((await account.read.recoveryNonce()) as bigint, 0n);
-      assert.strictEqual(await account.read.pendingGuardianSetRoot(), ZERO_BYTES32);
-    });
-
-    it("rejects zero owner sentinel (must be non-zero, deployable)", async function () {
+    it("rejects a zero-address EOA owner at init", async function () {
       const { factory, deployer } = await loadFixture(deployFixture);
-      await assertions.revert(
-        factory.write.createAccount([PK_X, PK_Y, zeroAddress, 999n], { account: deployer.account }),
+      await assertions.revertWithCustomError(
+        factory.write.createAccount([[encodeAddressOwner(zeroAddress)], 999n], {
+          account: deployer.account,
+        }),
+        null,
+        "ZeroAddress",
       );
     });
 
     it("rejects (0,0) passkey at init", async function () {
       const { factory, deployer } = await loadFixture(deployFixture);
       await assertions.revert(
-        factory.write.createAccount([ZERO_BYTES32, ZERO_BYTES32, OWNER_SENTINEL, 998n], {
+        factory.write.createAccount([[encodePasskeyOwner(ZERO_BYTES32, ZERO_BYTES32)], 998n], {
           account: deployer.account,
         }),
       );
     });
 
-    it("rejects an EITHER-zero (on-axis) passkey coordinate at init: (x,0) and (0,y) (L-3)", async function () {
+    it("rejects an EITHER-zero (on-axis) passkey coordinate at init: (x,0) and (0,y)", async function () {
       const { factory, deployer } = await loadFixture(deployFixture);
       await assertions.revertWithCustomError(
-        factory.write.createAccount([PK_X, ZERO_BYTES32, OWNER_SENTINEL, 996n], {
+        factory.write.createAccount([[encodePasskeyOwner(PK_X, ZERO_BYTES32)], 996n], {
           account: deployer.account,
         }),
         null,
         "InvalidPublicKey",
       );
       await assertions.revertWithCustomError(
-        factory.write.createAccount([ZERO_BYTES32, PK_Y, OWNER_SENTINEL, 997n], {
+        factory.write.createAccount([[encodePasskeyOwner(ZERO_BYTES32, PK_Y)], 997n], {
           account: deployer.account,
         }),
         null,
@@ -152,37 +158,53 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       );
     });
 
-    it("rejects an OFF-CURVE (non-zero) passkey at init", async function () {
+    it("rejects an OFF-CURVE (non-zero) passkey at init ", async function () {
       const { factory, deployer } = await loadFixture(deployFixture);
       // Both coords non-zero, but (NEW_PK_X, PK_Y) is not a point on the P256 curve.
       await assertions.revertWithCustomError(
-        factory.write.createAccount([OFFCURVE_X, OFFCURVE_Y, OWNER_SENTINEL, 995n], {
+        factory.write.createAccount([[encodePasskeyOwner(OFFCURVE_X, OFFCURVE_Y)], 995n], {
           account: deployer.account,
         }),
         null,
         "InvalidPublicKey",
+      );
+    });
+
+    it("rejects an owner blob of any length other than 32 or 64 bytes", async function () {
+      const { factory, deployer } = await loadFixture(deployFixture);
+      await assertions.revertWithCustomError(
+        factory.write.createAccount([["0x1234" as Hex], 994n], { account: deployer.account }),
+        null,
+        "InvalidOwnerBytesLength",
       );
     });
 
     it("rejects reinitialization", async function () {
       const { account, deployer } = await loadFixture(deployFixture);
       await assertions.revert(
-        account.write.initialize([PK_X, PK_Y, OWNER_SENTINEL], { account: deployer.account }),
+        account.write.initialize([[encodePasskeyOwner(PK_X, PK_Y)]], { account: deployer.account }),
       );
     });
   });
 
-  // ============ onlySelf enforcement (no EOA authority) ============
+  // ============ onlySelf enforcement (no EOA/operator authority) ============
   describe("onlySelf enforcement", function () {
-    it("rejects changePasskey from any EOA (incl. owner sentinel holder is irrelevant)", async function () {
+    it("rejects addOwnerAddress / addOwnerPublicKey / removeOwnerAtIndex from any EOA", async function () {
       const { account, deployer, stranger } = await loadFixture(deployFixture);
       await assertions.revertWithCustomError(
-        account.write.changePasskey([NEW_PK_X, NEW_PK_Y], { account: deployer.account }),
+        account.write.addOwnerAddress([stranger.account.address], { account: deployer.account }),
         account,
         "OnlySelf",
       );
       await assertions.revertWithCustomError(
-        account.write.changePasskey([NEW_PK_X, NEW_PK_Y], { account: stranger.account }),
+        account.write.addOwnerPublicKey([NEW_PK_X, NEW_PK_Y], { account: stranger.account }),
+        account,
+        "OnlySelf",
+      );
+      await assertions.revertWithCustomError(
+        account.write.removeOwnerAtIndex([0n, encodePasskeyOwner(PK_X, PK_Y)], {
+          account: deployer.account,
+        }),
         account,
         "OnlySelf",
       );
@@ -220,9 +242,9 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
     });
   });
 
-  // ============ Tier 1: passkey signature gating ============
-  describe("Passkey signature validation", function () {
-    it("rejects a userOp signed by the WRONG passkey (AA24)", async function () {
+  // ============ Owner signature gating ============
+  describe("Owner signature validation", function () {
+    it("rejects a userOp signed by an UNREGISTERED passkey (AA24)", async function () {
       const { publicClient, entryPoint, account, walletAddr, deployer, beneficiary } =
         await loadFixture(deployFixture);
       // no-op callData: execute(self, 0, "0x") -> hits receive()
@@ -234,16 +256,49 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       const nonce = (await entryPoint.read.getNonce([walletAddr, 0n])) as bigint;
       const userOp = buildUserOp(walletAddr, nonce, callData);
       const userOpHash = (await entryPoint.read.getUserOpHash([userOp])) as Hex;
-      // sign with the NEW (wrong) passkey, but the wallet stores PK_X/PK_Y
-      userOp.signature = webauthnSignature(userOpHash, NEW_PASSKEY_PRIV);
+      // sign with a passkey the wallet never registered (wallet only knows owner index 0 = PK_X/Y)
+      userOp.signature = encodeSignatureWrapper(
+        0n,
+        webauthnSignature(userOpHash, NEW_PASSKEY_PRIV),
+      );
+      // Tightened: a bare `assert.rejects` here passes on ANY
+      // rejection, including AA23 (a wallet-level revert) — which is exactly how V1's checked-
+      // arithmetic panic (`128 + len > signature.length` overflowing to a Panic 0x11, surfaced as
+      // AA23 reverted) stayed hidden despite this test's name promising AA24 coverage. A
+      // signature-mismatch MUST be a clean `SIG_VALIDATION_FAILED` (EntryPoint's AA24), never a
+      // revert.
       await assert.rejects(
         entryPoint.write.handleOps([[userOp], beneficiary.account.address], {
           account: deployer.account,
         }),
+        /AA24/,
       );
     });
 
-    it("accepts a userOp signed by the CORRECT passkey", async function () {
+    it("rejects a userOp naming an unregistered ownerIndex (SIG_VALIDATION_FAILED, not a revert)", async function () {
+      const { publicClient, entryPoint, account, walletAddr, deployer, beneficiary } =
+        await loadFixture(deployFixture);
+      const callData = encodeFunctionData({
+        abi: account.abi,
+        functionName: "execute",
+        args: [walletAddr, 0n, "0x"],
+      });
+      const nonce = (await entryPoint.read.getNonce([walletAddr, 0n])) as bigint;
+      const userOp = buildUserOp(walletAddr, nonce, callData);
+      const userOpHash = (await entryPoint.read.getUserOpHash([userOp])) as Hex;
+      // ownerIndex 7 was never registered — a genuine assertion under the real passkey, but for
+      // a slot that names no owner.
+      userOp.signature = encodeSignatureWrapper(7n, webauthnSignature(userOpHash, PASSKEY_PRIV));
+      // EntryPoint's own AA24 signature-error path (not a raw revert from the wallet itself).
+      await assert.rejects(
+        entryPoint.write.handleOps([[userOp], beneficiary.account.address], {
+          account: deployer.account,
+        }),
+        /AA24/,
+      );
+    });
+
+    it("accepts a userOp signed by the registered owner-0 passkey", async function () {
       const ctx = await loadFixture(deployFixture);
       // no-op self-call succeeds (receive)
       const receipt = await selfCall(ctx, "0x");
@@ -251,170 +306,96 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
     });
   });
 
-  // ============ Tier 2: passkey self-rotation ============
-  describe("Self passkey rotation (Tier 2)", function () {
-    it("rotates passkey via passkey self-call, and the NEW passkey can then sign", async function () {
+  // ============ Owner set management ============
+  describe("Owner set management", function () {
+    it("adds a second passkey owner via a self-call, and that NEW owner can then sign", async function () {
       const ctx = await loadFixture(deployFixture);
-      const { account } = ctx;
+      const { account, entryPoint, walletAddr, deployer, beneficiary } = ctx;
 
-      const rotateCalldata = encodeFunctionData({
+      const addCalldata = encodeFunctionData({
         abi: account.abi,
-        functionName: "changePasskey",
+        functionName: "addOwnerPublicKey",
         args: [NEW_PK_X, NEW_PK_Y],
       });
-      const receipt = await selfCall(ctx, rotateCalldata, PASSKEY_PRIV);
-      assert.ok(opSucceeded(receipt, ctx.entryPoint.abi), "rotation op should succeed");
-      assert.strictEqual(await account.read.publicKeyX(), NEW_PK_X);
-      assert.strictEqual(await account.read.publicKeyY(), NEW_PK_Y);
+      const receipt = await selfCall(ctx, addCalldata, PASSKEY_PRIV);
+      assert.ok(opSucceeded(receipt, entryPoint.abi), "addOwnerPublicKey op should succeed");
 
-      // The NEW passkey now controls the wallet: a no-op signed by it must succeed.
-      const receipt2 = await selfCall(ctx, "0x", NEW_PASSKEY_PRIV);
-      assert.ok(opSucceeded(receipt2, ctx.entryPoint.abi), "new passkey should control the wallet");
+      const added = parseEventLogs({
+        abi: account.abi,
+        logs: receipt.logs,
+        eventName: "AddOwner",
+      })[0] as any;
+      assert.strictEqual(added.args.index as bigint, 1n);
+      assert.strictEqual(added.args.owner, encodePasskeyOwner(NEW_PK_X, NEW_PK_Y));
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 2n);
 
-      // The OLD passkey no longer controls it.
-      const noopCalldata = encodeFunctionData({
+      // The NEW owner (index 1) now independently controls the wallet.
+      const callData = encodeFunctionData({
         abi: account.abi,
         functionName: "execute",
-        args: [ctx.walletAddr, 0n, "0x"],
+        args: [walletAddr, 0n, "0x"],
       });
-      const nonce = (await ctx.entryPoint.read.getNonce([ctx.walletAddr, 0n])) as bigint;
-      const userOp = buildUserOp(ctx.walletAddr, nonce, noopCalldata);
-      const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
-      userOp.signature = webauthnSignature(userOpHash, PASSKEY_PRIV); // old key
-      await assert.rejects(
-        ctx.entryPoint.write.handleOps([[userOp], ctx.beneficiary.account.address], {
-          account: ctx.deployer.account,
-        }),
+      const nonce = (await entryPoint.read.getNonce([walletAddr, 0n])) as bigint;
+      const userOp = buildUserOp(walletAddr, nonce, callData);
+      const userOpHash = (await entryPoint.read.getUserOpHash([userOp])) as Hex;
+      userOp.signature = encodeSignatureWrapper(
+        1n,
+        webauthnSignature(userOpHash, NEW_PASSKEY_PRIV),
+      );
+      const hash = await entryPoint.write.handleOps([[userOp], beneficiary.account.address], {
+        account: deployer.account,
+      });
+      const receipt2 = await ctx.publicClient.waitForTransactionReceipt({ hash });
+      assert.ok(
+        opSucceeded(receipt2, entryPoint.abi),
+        "new owner should independently control the wallet",
+      );
+
+      // The OLD owner (index 0) is STILL valid too — this is concurrent, not exclusive, control.
+      const receipt3 = await selfCall(ctx, "0x", PASSKEY_PRIV);
+      assert.ok(
+        opSucceeded(receipt3, entryPoint.abi),
+        "original owner must still control the wallet",
       );
     });
 
-    it("self-call changePasskey to (0,0) fails the op (passkey unchanged)", async function () {
+    it("adds an EOA-style address owner, which can then sign via plain ECDSA over the raw digest", async function () {
       const ctx = await loadFixture(deployFixture);
-      const { account } = ctx;
-      const badCalldata = encodeFunctionData({
+      const { account, entryPoint, walletAddr, deployer, beneficiary } = ctx;
+      const eoaOwner = privateKeyToAccount(EOA_OWNER_PRIV);
+
+      const addCalldata = encodeFunctionData({
         abi: account.abi,
-        functionName: "changePasskey",
-        args: [ZERO_BYTES32, ZERO_BYTES32],
+        functionName: "addOwnerAddress",
+        args: [eoaOwner.address],
       });
-      const receipt = await selfCall(ctx, badCalldata, PASSKEY_PRIV);
+      const receipt = await selfCall(ctx, addCalldata, PASSKEY_PRIV);
+      assert.ok(opSucceeded(receipt, entryPoint.abi));
       assert.strictEqual(
-        opSucceeded(receipt, ctx.entryPoint.abi),
-        false,
-        "(0,0) rotation must fail",
+        await account.read.ownerAtIndex([1n]),
+        encodeAddressOwner(eoaOwner.address),
       );
-      assert.strictEqual(await account.read.publicKeyX(), PK_X); // unchanged
-    });
 
-    it("self-call changePasskey to an EITHER-zero coordinate fails the op: (x,0) and (0,y) (L-3)", async function () {
-      const ctx = await loadFixture(deployFixture);
-      const { account } = ctx;
-
-      const xZeroY = encodeFunctionData({
+      // {_verifyOwnerSignature}'s 32-byte-owner branch recovers over the digest DIRECTLY (no
+      // EIP-191 "\x19Ethereum Signed Message" prefix, matching how the P-256 branch also signs the
+      // challenge directly) — `account.sign({ hash })` produces exactly that, unlike
+      // `signMessage`, which applies the personal-sign prefix.
+      const callData = encodeFunctionData({
         abi: account.abi,
-        functionName: "changePasskey",
-        args: [NEW_PK_X, ZERO_BYTES32],
+        functionName: "execute",
+        args: [walletAddr, 0n, "0x"],
       });
-      const r1 = await selfCall(ctx, xZeroY, PASSKEY_PRIV);
-      assert.strictEqual(opSucceeded(r1, ctx.entryPoint.abi), false, "(x,0) rotation must fail");
-      assert.strictEqual(await account.read.publicKeyX(), PK_X); // unchanged
+      const nonce = (await entryPoint.read.getNonce([walletAddr, 0n])) as bigint;
+      const userOp = buildUserOp(walletAddr, nonce, callData);
+      const userOpHash = (await entryPoint.read.getUserOpHash([userOp])) as Hex;
+      const rawSig = await eoaOwner.sign({ hash: userOpHash });
+      userOp.signature = encodeSignatureWrapper(1n, rawSig);
 
-      const zeroXY = encodeFunctionData({
-        abi: account.abi,
-        functionName: "changePasskey",
-        args: [ZERO_BYTES32, NEW_PK_Y],
+      const hash = await entryPoint.write.handleOps([[userOp], beneficiary.account.address], {
+        account: deployer.account,
       });
-      const r2 = await selfCall(ctx, zeroXY, PASSKEY_PRIV);
-      assert.strictEqual(opSucceeded(r2, ctx.entryPoint.abi), false, "(0,y) rotation must fail");
-      assert.strictEqual(await account.read.publicKeyY(), PK_Y); // unchanged
-    });
-
-    it("self-call changePasskey to an OFF-CURVE (non-zero) point fails the op", async function () {
-      const ctx = await loadFixture(deployFixture);
-      const { account } = ctx;
-      const offCurve = encodeFunctionData({
-        abi: account.abi,
-        functionName: "changePasskey",
-        args: [OFFCURVE_X, OFFCURVE_Y], // both non-zero, but not on the P256 curve
-      });
-      const r = await selfCall(ctx, offCurve, PASSKEY_PRIV);
-      assert.strictEqual(
-        opSucceeded(r, ctx.entryPoint.abi),
-        false,
-        "off-curve rotation must fail (would brick the wallet)",
-      );
-      assert.strictEqual(await account.read.publicKeyX(), PK_X); // unchanged
-      assert.strictEqual(await account.read.publicKeyY(), PK_Y); // unchanged
-    });
-  });
-
-  // ============ Upgrade: passkey self-call + timelock ============
-  describe("Upgrade (passkey self-call + 48h timelock)", function () {
-    it("request -> timelock -> upgrade succeeds via passkey self-call", async function () {
-      const ctx = await loadFixture(deployFixture);
-      const { account, walletAddr, publicClient, viem, entryPoint } = ctx;
-
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
-
-      // request upgrade (self-call)
-      const reqCalldata = encodeFunctionData({
-        abi: account.abi,
-        functionName: "requestUpgrade",
-        args: [newImpl.address],
-      });
-      const r1 = await selfCall(ctx, reqCalldata);
-      assert.ok(opSucceeded(r1, entryPoint.abi));
-      assert.strictEqual(
-        getAddress((await account.read.pendingImplementation()) as string),
-        getAddress(newImpl.address),
-      );
-
-      // too early -> upgrade op fails (timelock)
-      const upCalldata = encodeFunctionData({
-        abi: account.abi,
-        functionName: "upgradeToAndCall",
-        args: [newImpl.address, "0x"],
-      });
-      const rEarly = await selfCall(ctx, upCalldata);
-      assert.strictEqual(
-        opSucceeded(rEarly, entryPoint.abi),
-        false,
-        "upgrade before timelock must fail",
-      );
-
-      // advance past timelock, then upgrade
-      await time.increase(UPGRADE_TIMELOCK + 1n);
-      const r2 = await selfCall(ctx, upCalldata);
-      assert.ok(opSucceeded(r2, entryPoint.abi), "upgrade after timelock should succeed");
-
-      const raw = (await publicClient.getStorageAt({
-        address: walletAddr,
-        slot: ERC1967_IMPL_SLOT,
-      })) as Hex;
-      const implAddr = getAddress(("0x" + raw.slice(26)) as Hex);
-      assert.strictEqual(implAddr, getAddress(newImpl.address));
-    });
-
-    it("cancelUpgrade via passkey self-call clears pending", async function () {
-      const ctx = await loadFixture(deployFixture);
-      const { account, viem, entryPoint } = ctx;
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
-
-      await selfCall(
-        ctx,
-        encodeFunctionData({
-          abi: account.abi,
-          functionName: "requestUpgrade",
-          args: [newImpl.address],
-        }),
-      );
-      assert.notStrictEqual(await account.read.pendingImplementation(), zeroAddress);
-
-      const r = await selfCall(
-        ctx,
-        encodeFunctionData({ abi: account.abi, functionName: "cancelUpgrade", args: [] }),
-      );
-      assert.ok(opSucceeded(r, entryPoint.abi));
-      assert.strictEqual(await account.read.pendingImplementation(), zeroAddress);
+      const opReceipt = await ctx.publicClient.waitForTransactionReceipt({ hash });
+      assert.ok(opSucceeded(opReceipt, entryPoint.abi), "ECDSA-owner-signed userOp should succeed");
     });
   });
 
@@ -432,7 +413,7 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
 
   // ============ Token receiver ============
   describe("Token receiver (ERC721 / ERC1155 holder)", function () {
-    it("receives an ERC721 via _safeMint", async function () {
+    it("receives an ERC721 via _safeMint (e.g. the platform's own StarGenesis)", async function () {
       const { viem, walletAddr, deployer } = await loadFixture(deployFixture);
       const nft = await viem.deployContract("MockERC721", []);
       // _safeMint runs the onERC721Received acceptance check on the contract recipient.
@@ -497,7 +478,7 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       const nonce = (await ctx.entryPoint.read.getNonce([ctx.walletAddr, 0n])) as bigint;
       const userOp = buildUserOp(ctx.walletAddr, nonce, callData);
       const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
-      userOp.signature = webauthnSignature(userOpHash, PASSKEY_PRIV);
+      userOp.signature = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
       const hash = await ctx.entryPoint.write.handleOps(
         [[userOp], ctx.beneficiary.account.address],
         { account: ctx.deployer.account },
@@ -536,39 +517,45 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       assert.ok(opSucceeded(rOk, entryPoint.abi), "must succeed exactly at T");
     });
 
-    it("emits PasskeyRotated(old,new) and UpgradeRequested(readyAt = now + 48h)", async function () {
+    it("emits AddOwner(index,owner) and UpgradeRequested(readyAt = now + 48h)", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
 
-      const rotR = await selfCall(
+      const addR = await selfCall(
         ctx,
         encodeFunctionData({
           abi: account.abi,
-          functionName: "changePasskey",
+          functionName: "addOwnerPublicKey",
           args: [NEW_PK_X, NEW_PK_Y],
         }),
         PASSKEY_PRIV,
       );
-      const pr = parseEventLogs({
+      const ao = parseEventLogs({
         abi: account.abi,
-        logs: rotR.logs,
-        eventName: "PasskeyRotated",
+        logs: addR.logs,
+        eventName: "AddOwner",
       })[0] as any;
-      assert.strictEqual(pr.args.oldX, PK_X);
-      assert.strictEqual(pr.args.newX, NEW_PK_X);
-      assert.strictEqual(pr.args.newY, NEW_PK_Y);
+      assert.strictEqual(ao.args.index as bigint, 1n);
+      assert.strictEqual(ao.args.owner, encodePasskeyOwner(NEW_PK_X, NEW_PK_Y));
 
-      // request upgrade with the NEW key; assert readyAt == upgradeRequestedAt + 48h
+      // request upgrade with the NEW owner (index 1); assert readyAt == upgradeRequestedAt + 48h
       const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
-      const reqR = await selfCall(
-        ctx,
-        encodeFunctionData({
+      const reqR = await execViaPasskey({
+        publicClient: ctx.publicClient,
+        entryPoint: ctx.entryPoint,
+        walletAbi: account.abi,
+        walletAddr: ctx.walletAddr,
+        target: ctx.walletAddr,
+        innerCalldata: encodeFunctionData({
           abi: account.abi,
           functionName: "requestUpgrade",
           args: [newImpl.address],
         }),
-        NEW_PASSKEY_PRIV,
-      );
+        passkeyPriv: NEW_PASSKEY_PRIV,
+        submitter: ctx.deployer,
+        beneficiary: ctx.beneficiary.account.address,
+        ownerIndex: 1n,
+      });
       const ur = parseEventLogs({
         abi: account.abi,
         logs: reqR.logs,
@@ -578,7 +565,7 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       assert.strictEqual(ur.args.readyAt as bigint, requestedAt + UPGRADE_TIMELOCK);
     });
 
-    it("changePasskey cancels a pending upgrade (P1-2 incident-response)", async function () {
+    it("addOwnerPublicKey cancels a pending upgrade (P1-2 incident-response, extended to owner-set changes)", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
       const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
@@ -593,32 +580,161 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       );
       assert.notStrictEqual(await account.read.pendingImplementation(), zeroAddress);
 
-      const rotR = await selfCall(
+      const addR = await selfCall(
         ctx,
         encodeFunctionData({
           abi: account.abi,
-          functionName: "changePasskey",
+          functionName: "addOwnerPublicKey",
           args: [NEW_PK_X, NEW_PK_Y],
         }),
         PASSKEY_PRIV,
       );
-      assert.ok(opSucceeded(rotR, entryPoint.abi));
+      assert.ok(opSucceeded(addR, entryPoint.abi));
       assert.strictEqual(
         await account.read.pendingImplementation(),
         zeroAddress,
-        "rotation must clear pending upgrade",
+        "adding an owner must clear pending upgrade",
       );
       assert.strictEqual((await account.read.upgradeRequestedAt()) as bigint, 0n);
       const cancelled = parseEventLogs({
         abi: account.abi,
-        logs: rotR.logs,
+        logs: addR.logs,
         eventName: "UpgradeCancelled",
       });
       assert.strictEqual(
         cancelled.length,
         1,
-        "UpgradeCancelled must be emitted on rotation-clears-upgrade",
+        "UpgradeCancelled must be emitted when adding an owner clears a pending upgrade",
       );
+    });
+
+    it("removeOwnerAtIndex cancels a pending upgrade too", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const { account, viem, entryPoint } = ctx;
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
+
+      await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "addOwnerPublicKey",
+          args: [NEW_PK_X, NEW_PK_Y],
+        }),
+      );
+      await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "requestUpgrade",
+          args: [newImpl.address],
+        }),
+      );
+      assert.notStrictEqual(await account.read.pendingImplementation(), zeroAddress);
+
+      const removeR = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "removeOwnerAtIndex",
+          args: [1n, encodePasskeyOwner(NEW_PK_X, NEW_PK_Y)],
+        }),
+      );
+      assert.ok(opSucceeded(removeR, entryPoint.abi));
+      assert.strictEqual(await account.read.pendingImplementation(), zeroAddress);
+      assert.strictEqual((await account.read.upgradeRequestedAt()) as bigint, 0n);
+    });
+
+    it("removeOwnerAtIndex reverts LastOwner when it is the only owner left", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const { account, entryPoint } = ctx;
+      const r = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "removeOwnerAtIndex",
+          args: [0n, encodePasskeyOwner(PK_X, PK_Y)],
+        }),
+      );
+      assert.strictEqual(
+        opSucceeded(r, entryPoint.abi),
+        false,
+        "removing the last owner must fail",
+      );
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 1n);
+    });
+
+    it("removeOwnerAtIndex reverts OwnerMismatch when expectedOwner is stale", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const { account, entryPoint } = ctx;
+      await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "addOwnerPublicKey",
+          args: [NEW_PK_X, NEW_PK_Y],
+        }),
+      );
+      const r = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "removeOwnerAtIndex",
+          args: [1n, encodePasskeyOwner(PK_X, PK_Y)], // wrong owner for index 1
+        }),
+      );
+      assert.strictEqual(
+        opSucceeded(r, entryPoint.abi),
+        false,
+        "mismatched expectedOwner must fail",
+      );
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 2n);
+    });
+
+    it("addOwnerPublicKey rejects a duplicate of an already-registered owner", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const { account, entryPoint } = ctx;
+      const r = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "addOwnerPublicKey",
+          args: [PK_X, PK_Y], // same as owner 0
+        }),
+      );
+      assert.strictEqual(opSucceeded(r, entryPoint.abi), false, "duplicate owner must be rejected");
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 1n);
+    });
+
+    it("addOwnerAddress rejects the zero address", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const { account, entryPoint } = ctx;
+      const r = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "addOwnerAddress",
+          args: [zeroAddress],
+        }),
+      );
+      assert.strictEqual(
+        opSucceeded(r, entryPoint.abi),
+        false,
+        "zero address owner must be rejected",
+      );
+    });
+
+    it("addOwnerPublicKey rejects an off-curve point (would create an unusable owner)", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const { account, entryPoint } = ctx;
+      const r = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "addOwnerPublicKey",
+          args: [OFFCURVE_X, OFFCURVE_Y],
+        }),
+      );
+      assert.strictEqual(opSucceeded(r, entryPoint.abi), false, "off-curve owner must be rejected");
     });
 
     it("requestUpgrade to a non-contract (EOA) fails the op (P2-A)", async function () {
@@ -641,52 +757,65 @@ describe("StarzipWallet v1 (social-recovery, self-owned)", function () {
       const implAddr = (await factory.read.accountImplementation()) as Address;
       const impl = await viem.getContractAt("StarzipWallet", implAddr);
       await assertions.revert(
-        impl.write.initialize([PK_X, PK_Y, OWNER_SENTINEL], { account: deployer.account }),
+        impl.write.initialize([[encodePasskeyOwner(PK_X, PK_Y)]], { account: deployer.account }),
       );
     });
 
-    it("owner sentinel and guardian/recovery slots stay untouched across a full admin lifecycle", async function () {
+    it("owner set survives a full admin lifecycle (add, request+cancel upgrade, request+execute upgrade)", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
       const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
 
-      // rotate, request+cancel upgrade, then request+execute upgrade
       await selfCall(
         ctx,
         encodeFunctionData({
           abi: account.abi,
-          functionName: "changePasskey",
+          functionName: "addOwnerPublicKey",
           args: [NEW_PK_X, NEW_PK_Y],
         }),
         PASSKEY_PRIV,
       );
-      await selfCall(
-        ctx,
-        encodeFunctionData({
+      await execViaPasskey({
+        publicClient: ctx.publicClient,
+        entryPoint: ctx.entryPoint,
+        walletAbi: account.abi,
+        walletAddr: ctx.walletAddr,
+        target: ctx.walletAddr,
+        innerCalldata: encodeFunctionData({
           abi: account.abi,
           functionName: "requestUpgrade",
           args: [newImpl.address],
         }),
-        NEW_PASSKEY_PRIV,
-      );
-      await selfCall(
-        ctx,
-        encodeFunctionData({ abi: account.abi, functionName: "cancelUpgrade", args: [] }),
-        NEW_PASSKEY_PRIV,
-      );
+        passkeyPriv: NEW_PASSKEY_PRIV,
+        submitter: ctx.deployer,
+        beneficiary: ctx.beneficiary.account.address,
+        ownerIndex: 1n,
+      });
+      await execViaPasskey({
+        publicClient: ctx.publicClient,
+        entryPoint: ctx.entryPoint,
+        walletAbi: account.abi,
+        walletAddr: ctx.walletAddr,
+        target: ctx.walletAddr,
+        innerCalldata: encodeFunctionData({
+          abi: account.abi,
+          functionName: "cancelUpgrade",
+          args: [],
+        }),
+        passkeyPriv: NEW_PASSKEY_PRIV,
+        submitter: ctx.deployer,
+        beneficiary: ctx.beneficiary.account.address,
+        ownerIndex: 1n,
+      });
 
-      // owner sentinel never changed
+      // both owners survive untouched
+      assert.strictEqual(await account.read.ownerAtIndex([0n]), encodePasskeyOwner(PK_X, PK_Y));
       assert.strictEqual(
-        getAddress((await account.read.owner()) as string),
-        getAddress(OWNER_SENTINEL),
+        await account.read.ownerAtIndex([1n]),
+        encodePasskeyOwner(NEW_PK_X, NEW_PK_Y),
       );
-      // guardian/recovery storage never written by any v1 path
-      assert.strictEqual(await account.read.guardianSetRoot(), ZERO_BYTES32);
-      assert.strictEqual((await account.read.guardianThreshold()) as bigint, 0n);
-      assert.strictEqual((await account.read.recoveryRequestedAt()) as bigint, 0n);
-      assert.strictEqual((await account.read.recoveryNonce()) as bigint, 0n);
-      assert.strictEqual(await account.read.pendingGuardianSetRoot(), ZERO_BYTES32);
-      assert.strictEqual((await account.read.guardianChangeRequestedAt()) as bigint, 0n);
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 2n);
+      assert.strictEqual(await account.read.pendingImplementation(), zeroAddress);
     });
 
     it("executeBatch happy path: multiple inner calls + BatchExecuted", async function () {

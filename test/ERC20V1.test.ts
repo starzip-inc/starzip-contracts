@@ -39,7 +39,7 @@ describe("ERC20V1", function () {
 
     // Issue one token. The entire LIQUIDITY_RESERVE bucket (100%, self-deal guard blocks
     // routing it directly to businessAccount at issuance time) is forwarded to `business`,
-    // mirroring the "business holds ~90%+ immediately" assumption this file relies
+    // mirroring the pre-delta "business holds ~90%+ immediately" assumption this file relies
     // on. Supply is fixed at issuance (TokenFactory locks `maxSupply == totalSupply`
     // immediately after minting) — there is no post-issuance mint path, so test accounts
     // that need a balance are funded via a plain `transfer` from `business`.

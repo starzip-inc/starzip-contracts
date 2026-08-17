@@ -5,7 +5,7 @@ import { IPaymaster } from "@account-abstraction/contracts/interfaces/IPaymaster
 
 /**
  * @dev Test-only "fake EntryPoint" used to empirically measure `VerifyingPaymaster._postOp`'s
- *      worst-case (cold) gas cost, for deriving `MIN_POSTOP_GAS` (Finding M-1).
+ *      worst-case (cold) gas cost, for deriving `MIN_POSTOP_GAS`.
  *
  *      Satisfies `BasePaymaster`'s constructor-time ERC165 interface check
  *      (`supportsInterface` unconditionally true) so a `VerifyingPaymaster` can be deployed with

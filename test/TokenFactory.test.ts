@@ -54,11 +54,19 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
 
     await configureDefaultAllocationGuides(tokenFactory, owner);
 
-    const launchpadImpl = await viem.deployContract("LaunchpadV1", []);
+    const launchpadImplMathLib = await viem.deployContract("LaunchpadMathLib", []);
+    const launchpadImpl = await viem.deployContract("LaunchpadV1", [], {
+      libraries: { LaunchpadMathLib: launchpadImplMathLib.address },
+    });
     const launchpadInitData = encodeFunctionData({
       abi: launchpadImpl.abi,
       functionName: "initialize",
-      args: [tokenFactory.address, usdt.address, platformTreasury.account.address],
+      args: [
+        tokenFactory.address,
+        usdt.address,
+        platformTreasury.account.address,
+        platformTreasury.account.address,
+      ],
     });
     const launchpadProxy = await viem.deployContract("ERC1967Proxy", [
       launchpadImpl.address,
@@ -668,7 +676,7 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
     });
   });
 
-  describe("Allocation invariants", function () {
+  describe("Allocation invariants (O1)", function () {
     it("should reject bucket sum != 10000", async function () {
       const fx = await loadFixture(deployTokenFactoryFixture);
       const ratios = buildRatios({
@@ -761,7 +769,7 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
     });
   });
 
-  describe("LAUNCHPAD bucket escrow", function () {
+  describe("O2: LAUNCHPAD bucket escrow", function () {
     it("factory holds the LAUNCHPAD bucket in custody after issuance", async function () {
       const fx = await loadFixture(deployTokenFactoryFixture);
       const { tokenFactory, viem } = fx;
@@ -929,7 +937,7 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
     });
   });
 
-  describe("Owner Vesting wallet", function () {
+  describe("Owner Vesting wallet (O4b / delta)", function () {
     it("deploys a vesting wallet on every issuance and routes the OWNER bucket to it", async function () {
       const fx = await loadFixture(deployTokenFactoryFixture);
       const { tokenFactory, launchpad, viem } = fx;
@@ -955,6 +963,117 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
       assert.strictEqual(await wallet.read.launchpad(), getAddress(launchpad.address));
       assert.strictEqual(await wallet.read.owner(), getAddress(fx.business.account.address));
       assert.strictEqual(await wallet.read.started(), false);
+    });
+  });
+
+  describe("launchpadBp == 0 must not strand the owner vesting wallet", function () {
+    // When launchpadBp == 0 (or, per the
+    // mulDiv proof in _validateRatios' rounding, ONLY when it is exactly 0 — see the "rounding
+    // cannot produce a zero launchpadAmount for launchpadBp > 0" note below), `issueToken` funds
+    // NO escrow for the token. `createLaunchpad` (LaunchpadV1) and `reclaimEscrow` (this
+    // contract) are the ONLY two callers of `TokenVestingWallet.startVesting` — both are gated on
+    // a nonzero escrow amount, so neither can ever run for this token. Before the fix, a funded
+    // OWNER_VESTING allocation is stuck in the deferred (`start == type(uint64).max`) state
+    // forever: pure ops footgun, no attacker required.
+    function zeroLaunchpadRatios(recipient: Address) {
+      return buildRatios({
+        launchpadBp: 0,
+        liquidityBp: 9000,
+        ownerBp: 1000,
+        liquidityRecipient: recipient,
+      });
+    }
+
+    it("funds no escrow when launchpadBp == 0", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const ratios = zeroLaunchpadRatios(fx.platformTreasury.account.address);
+      const { tokenAddress } = await issueDefault(fx, { ratios });
+
+      assert.strictEqual(await fx.tokenFactory.read.launchpadEscrow([tokenAddress]), 0n);
+    });
+
+    it("createLaunchpad reverts NoEscrowAvailable — no launch can ever be created for this token", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const { launchpad, business, usdt } = fx;
+      const ratios = zeroLaunchpadRatios(fx.platformTreasury.account.address);
+      const { tokenAddress } = await issueDefault(fx, { ratios });
+
+      await assertions.revertWithCustomError(
+        launchpad.write.createLaunchpad(
+          [tokenAddress, parseUnits("1", 18), business.account.address, usdt.address, 0n, 0n],
+          { account: business.account },
+        ),
+        launchpad,
+        "NoEscrowAvailable",
+      );
+    });
+
+    it("reclaimEscrow reverts NoEscrowForToken — no fallback trigger via escrow reclaim either", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const { tokenFactory, owner, business } = fx;
+      await setEscrowTimeout(tokenFactory, owner, 3600n);
+      const ratios = zeroLaunchpadRatios(fx.platformTreasury.account.address);
+      const { tokenAddress } = await issueDefault(fx, { ratios });
+      await time.increase(3601n);
+
+      await assertions.revertWithCustomError(
+        tokenFactory.write.reclaimEscrow([tokenAddress], { account: business.account }),
+        tokenFactory,
+        "NoEscrowForToken",
+      );
+    });
+
+    it("starts the funded owner vesting wallet immediately at issuance instead of stranding it", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const { viem } = fx;
+      const ratios = zeroLaunchpadRatios(fx.platformTreasury.account.address);
+      const { tokenAddress, vestingWallet } = await issueDefault(fx, { ratios });
+
+      const wallet = await viem.getContractAt("TokenVestingWallet", vestingWallet);
+      assert.strictEqual(await wallet.read.started(), true);
+      assert.notStrictEqual(await wallet.read.start(), 2n ** 64n - 1n);
+
+      // End-to-end: the funded owner allocation actually vests and is claimable — not just
+      // `started() == true` in isolation.
+      await time.increase(ratios.ownerVestingDuration + 1n);
+      const token = await viem.getContractAt("ERC20V1", tokenAddress);
+      const ownerAmount = (TOTAL_SUPPLY * 1000n) / 10000n;
+      assert.strictEqual(await token.read.balanceOf([vestingWallet]), ownerAmount);
+
+      await wallet.write.release([], { account: fx.business.account });
+      assert.strictEqual(await token.read.balanceOf([fx.business.account.address]), ownerAmount);
+    });
+
+    it("rounding cannot produce a zero launchpadAmount for launchpadBp > 0", async function () {
+      // Proof by construction at the smallest possible totalSupply/launchpadBp margin: with
+      // launchpadBp == 1 (the smallest nonzero value) and ownerBp taking essentially the whole
+      // remainder, mulDiv's floor rounding on liquidityAmount/ownerAmount can only ever roll
+      // MORE into the launchpad remainder, never less — so launchpadAmount >= totalSupply *
+      // launchpadBp / 10000 > 0 whenever totalSupply >= 1 and launchpadBp >= 1. This is a
+      // mathematical invariant of `issueToken`'s "remainder rolls into LAUNCHPAD" distribution,
+      // not something that needs a guard — verified here at the tightest margin (totalSupply=1).
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const ratios = buildRatios({
+        launchpadBp: 1,
+        liquidityBp: 1, // LIQUIDITY_RESERVE guide floor (LIQUIDITY_RESERVE_MIN_BP_FLOOR) is 1
+        ownerBp: 9998,
+        liquidityRecipient: fx.platformTreasury.account.address,
+      });
+      const { tokenAddress } = await issueTokenWithRatios({
+        tokenFactory: fx.tokenFactory,
+        business: fx.business,
+        publicClient: fx.publicClient,
+        chainId: fx.chainId,
+        permitPrivateKey: TEST_PRIVATE_KEY,
+        linkedLaunchpad: fx.launchpad.address,
+        name: "TinyToken",
+        symbol: "TINY",
+        totalSupply: 1n,
+        contractURI: "",
+        ratios,
+      });
+
+      assert.strictEqual(await fx.tokenFactory.read.launchpadEscrow([tokenAddress]), 1n);
     });
   });
 
@@ -1041,51 +1160,102 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
     });
   });
 
-  describe("Token Ownership Transfer (Admin)", function () {
-    it("should allow admin to transfer token ownership", async function () {
+  describe("No platform seizure path for an issued token's ownership", function () {
+    // Owner decision: the platform must have no way at all to move an issued ERC20V1's
+    // ownership without the business's consent — not immediate, not timelocked. The old
+    // propose/execute/cancel timelock was itself a seizure path, just a slower one.
+    // `transferTokenOwnership` is kept only as an always-revert stub so a caller still
+    // holding the old ABI selector gets a readable reason instead of an opaque
+    // "no matching function".
+    it("transferTokenOwnership has no external path — reverts with TokenOwnershipIsBusinessOwned for any caller", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const { tokenFactory, user1, owner } = fx;
+
+      const { tokenAddress } = await issueDefault(fx);
+
+      // Non-owner caller — no access-control check happens before the revert.
+      await assertions.revertWithCustomError(
+        tokenFactory.write.transferTokenOwnership([tokenAddress, user1.account.address], {
+          account: user1.account,
+        }),
+        tokenFactory,
+        "TokenOwnershipIsBusinessOwned",
+      );
+
+      // Platform owner caller — reverts identically; there is no privileged path through
+      // this selector anymore.
+      await assertions.revertWithCustomError(
+        tokenFactory.write.transferTokenOwnership([tokenAddress, user1.account.address], {
+          account: owner.account,
+        }),
+        tokenFactory,
+        "TokenOwnershipIsBusinessOwned",
+      );
+    });
+
+    it("never changes ownership — the token's owner is identical before and after the call attempt", async function () {
       const fx = await loadFixture(deployTokenFactoryFixture);
       const { tokenFactory, user1, owner, viem } = fx;
 
       const { tokenAddress } = await issueDefault(fx);
       const token = await viem.getContractAt("ERC20V1", tokenAddress);
 
-      assert.strictEqual(await token.read.owner(), getAddress(fx.business.account.address));
-
-      await tokenFactory.write.transferTokenOwnership([tokenAddress, user1.account.address], {
-        account: owner.account,
-      });
-
-      assert.strictEqual(await token.read.owner(), getAddress(user1.account.address));
-    });
-
-    it("should reject non-owner admin calls for token ownership transfer", async function () {
-      const fx = await loadFixture(deployTokenFactoryFixture);
-      const { user1, tokenFactory } = fx;
-
-      const { tokenAddress } = await issueDefault(fx);
+      const ownerBefore = await token.read.owner();
+      assert.strictEqual(ownerBefore, getAddress(fx.business.account.address));
 
       await assertions.revertWithCustomError(
         tokenFactory.write.transferTokenOwnership([tokenAddress, user1.account.address], {
-          account: user1.account,
+          account: owner.account,
         }),
         tokenFactory,
-        "OwnableUnauthorizedAccount",
+        "TokenOwnershipIsBusinessOwned",
       );
+
+      const ownerAfter = await token.read.owner();
+      assert.strictEqual(ownerAfter, ownerBefore);
     });
 
-    it("should reject transferring non-issued token", async function () {
+    it("reverts even for an arbitrary non-issued token address (no state read, no TokenIssuanceFailed check)", async function () {
       const fx = await loadFixture(deployTokenFactoryFixture);
-      const { tokenFactory, business, viem, owner } = fx;
+      const { tokenFactory, user1, owner, viem } = fx;
 
       const randomToken = await viem.deployContract("USDT", [owner.account.address, 18]);
 
       await assertions.revertWithCustomError(
-        tokenFactory.write.transferTokenOwnership([randomToken.address, business.account.address], {
+        tokenFactory.write.transferTokenOwnership([randomToken.address, user1.account.address], {
           account: owner.account,
         }),
         tokenFactory,
-        "TokenIssuanceFailed",
+        "TokenOwnershipIsBusinessOwned",
       );
+    });
+
+    it("issueToken hands ownership to the business account, not the platform", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const { viem } = fx;
+
+      const { tokenAddress } = await issueDefault(fx);
+      const token = await viem.getContractAt("ERC20V1", tokenAddress);
+
+      assert.strictEqual(await token.read.owner(), getAddress(fx.business.account.address));
+    });
+
+    it("the business can still move its own token's ownership directly on the token (Ownable2Step)", async function () {
+      const fx = await loadFixture(deployTokenFactoryFixture);
+      const { business, user1, viem } = fx;
+
+      const { tokenAddress } = await issueDefault(fx);
+      const token = await viem.getContractAt("ERC20V1", tokenAddress);
+
+      assert.strictEqual(await token.read.owner(), getAddress(business.account.address));
+
+      await token.write.transferOwnership([user1.account.address], { account: business.account });
+      // Two-step: ownership has not moved yet, only nominated.
+      assert.strictEqual(await token.read.owner(), getAddress(business.account.address));
+      assert.strictEqual(await token.read.pendingOwner(), getAddress(user1.account.address));
+
+      await token.write.acceptOwnership([], { account: user1.account });
+      assert.strictEqual(await token.read.owner(), getAddress(user1.account.address));
     });
   });
 
@@ -1495,7 +1665,10 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
     it("should propose, execute and cancel a linkedLaunchpad change", async function () {
       const { tokenFactory, owner, viem, launchpad } = await loadFixture(deployTokenFactoryFixture);
 
-      const newLaunchpadImpl = await viem.deployContract("LaunchpadV1", []);
+      const newLaunchpadImplMathLib = await viem.deployContract("LaunchpadMathLib", []);
+      const newLaunchpadImpl = await viem.deployContract("LaunchpadV1", [], {
+        libraries: { LaunchpadMathLib: newLaunchpadImplMathLib.address },
+      });
 
       await tokenFactory.write.proposeLinkedLaunchpadChange([newLaunchpadImpl.address], {
         account: owner.account,
@@ -1646,7 +1819,10 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
       await tokenFactory.write.setTradeSettlement([user1.account.address], {
         account: owner.account,
       });
-      assert.strictEqual(await tokenFactory.read.tradeSettlement(), getAddress(user1.account.address));
+      assert.strictEqual(
+        await tokenFactory.read.tradeSettlement(),
+        getAddress(user1.account.address),
+      );
 
       await assertions.revertWithCustomError(
         tokenFactory.write.setTradeSettlement([user1.account.address], { account: owner.account }),
@@ -1724,7 +1900,10 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
       const clients = await fx.viem.getWalletClients();
       const unrelatedAccount = clients[4];
       assert.strictEqual(
-        await tokenFactory.read.isPlatformContract([tokenAddress, unrelatedAccount.account.address]),
+        await tokenFactory.read.isPlatformContract([
+          tokenAddress,
+          unrelatedAccount.account.address,
+        ]),
         false,
       );
     });
@@ -1750,7 +1929,9 @@ describe("TokenFactory (3-bucket / escrow / owner-vesting-wallet)", function () 
       );
 
       await time.increase(DELAY + 1n);
-      await tokenFactory.write.upgradeToAndCall([newImpl.address, "0x"], { account: owner.account });
+      await tokenFactory.write.upgradeToAndCall([newImpl.address, "0x"], {
+        account: owner.account,
+      });
 
       assert.strictEqual(
         getAddress((await tokenFactory.read.pendingImplementation()) as Address),

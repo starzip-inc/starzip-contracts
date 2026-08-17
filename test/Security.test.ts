@@ -18,6 +18,7 @@ import {
   configureDefaultAllocationGuides,
   setLinkedLaunchpad,
   setEscrowTimeout,
+  setResaleWait,
   issueTokenWithRatios,
   signIssuePermit,
   buildRatios,
@@ -83,11 +84,19 @@ describe("Security Tests", function () {
     await configureDefaultAllocationGuides(tokenFactory, owner);
 
     // Deploy LaunchpadV1
-    const launchpadImpl = await viem.deployContract("LaunchpadV1", []);
+    const launchpadImplMathLib = await viem.deployContract("LaunchpadMathLib", []);
+    const launchpadImpl = await viem.deployContract("LaunchpadV1", [], {
+      libraries: { LaunchpadMathLib: launchpadImplMathLib.address },
+    });
     const launchpadInitData = encodeFunctionData({
       abi: launchpadImpl.abi,
       functionName: "initialize",
-      args: [tokenFactory.address, usdt.address, feeRecipient.account.address],
+      args: [
+        tokenFactory.address,
+        usdt.address,
+        feeRecipient.account.address,
+        platformTreasury.account.address,
+      ],
     });
     const launchpadProxy = await viem.deployContract("ERC1967Proxy", [
       launchpadImpl.address,
@@ -95,11 +104,13 @@ describe("Security Tests", function () {
     ]);
     const launchpad = await viem.getContractAt("LaunchpadV1", launchpadProxy.address);
 
-    // Wire the real LaunchpadV1 as the factory's linkedLaunchpad — required
-    // before issueToken can succeed at all, since the vesting wallet deploy needs it.
+    // Wire the real LaunchpadV1 as the factory's linkedLaunchpad (O2 delta — required
+    // before issueToken can succeed at all, since the vesting wallet deploy needs it).
     await setLinkedLaunchpad(tokenFactory, owner, launchpad.address);
     // Escrow timeout must be set before issuing a token with a LAUNCHPAD bucket (fail-closed).
     await setEscrowTimeout(tokenFactory, owner, 7n * 24n * 60n * 60n);
+    // resale-wait must be set before any cancel path can restore escrow.
+    await setResaleWait(tokenFactory, owner, 7n * 24n * 60n * 60n);
 
     // Mint USDT
     await usdt.write.mint([user1.account.address, parseUnits("1000000", 18)]);
@@ -109,7 +120,7 @@ describe("Security Tests", function () {
     const chainId = await publicClient.getChainId();
 
     // Issue a token with a fixed 10% LAUNCHPAD bucket (= 100,000 of TOTAL_SUPPLY, the
-    // exact `saleAmount` this file's tests hardcoded) via the business account
+    // exact `saleAmount` this file's tests hardcoded pre-delta) via the business account
     // of the caller's choice. LIQUIDITY_RESERVE is routed to `platformTreasury` (a
     // neutral EOA, never used as `businessAccount` in this file).
     async function issueSimpleToken(
@@ -166,7 +177,7 @@ describe("Security Tests", function () {
 
       // A REAL issued token (business is the factory-recorded issuer) is required to reach
       // the caller-authorization check (createLaunchpad now authenticates _businessAccount
-      // against the factory-recorded issuer FIRST — C-1). Attacker passes the correct
+      // against the factory-recorded issuer FIRST). Attacker passes the correct
       // _businessAccount (the true issuer) but is neither owner nor that issuer themselves.
       const { tokenAddress } = await issueSimpleToken(business, "BusinessToken", "BTK");
 
@@ -216,7 +227,7 @@ describe("Security Tests", function () {
       const { launchpad, attacker } = await loadFixture(deploySecurityFixture);
 
       await assertions.revertWithCustomError(
-        launchpad.write.setLaunchpadFeeRate([500n], { account: attacker.account }),
+        launchpad.write.proposeLaunchpadFeeRateChange([500n], { account: attacker.account }),
         launchpad,
         "OwnableUnauthorizedAccount",
       );
@@ -436,7 +447,7 @@ describe("Security Tests", function () {
       const token = await viem.getContractAt("ERC20V1", tokenAddress);
 
       // Try batch blacklist including owner
-      // The M-3 fix should skip the owner silently
+      // The fix should skip the owner silently
       await token.write.batchAddToBlacklist([[owner.account.address, user1.account.address]], {
         account: owner.account,
       });
@@ -453,7 +464,7 @@ describe("Security Tests", function () {
 
   describe("Launchpad Locked Amount Tests", function () {
     // The LAUNCHPAD bucket is fixed at 10% of TOTAL_SUPPLY in `issueSimpleToken` —
-    // exactly the `saleAmount` these tests hardcoded. `createLaunchpad`
+    // exactly the `saleAmount` these tests hardcoded pre-delta. `createLaunchpad`
     // now derives it from the factory escrow (no approve/transfer needed).
     const saleAmount = parseUnits("100000", 18);
 
@@ -486,7 +497,7 @@ describe("Security Tests", function () {
     });
 
     it("should unlock tokens after finalization", async function () {
-      const { launchpad, owner, usdt, viem, issueSimpleToken } =
+      const { launchpad, owner, usdt, user1, viem, issueSimpleToken } =
         await loadFixture(deploySecurityFixture);
 
       const { tokenAddress } = await issueSimpleToken(owner, "Test Token", "TEST");
@@ -506,6 +517,16 @@ describe("Security Tests", function () {
         endTime: bigint;
       };
 
+      // finalizeLaunchpad now reverts (does not distribute/unlock anything) below
+      // the 20% softcap — participation must clear the floor for finalize to succeed
+      // (saleAmount is 100,000 here, requiredRaise is 20,000 at TOKEN_PRICE == 1).
+      const participationAmount = parseUnits("20000", 18); // exactly the 20% floor
+      await usdt.write.approve([launchpad.address, participationAmount], {
+        account: user1.account,
+      });
+      await time.increaseTo(launchpadInfo.startTime);
+      await launchpad.write.participate([0n, participationAmount], { account: user1.account });
+
       // Calculate how much time to advance: (endTime - current) + 1 second
       const currentTime = await time.latest();
       const timeToAdvance = launchpadInfo.endTime - currentTime + 1n;
@@ -516,9 +537,15 @@ describe("Security Tests", function () {
       // Finalize
       await launchpad.write.finalizeLaunchpad([0n], { account: owner.account });
 
+      // finalizeLaunchpad only releases the UNSOLD portion of the lock (the
+      // sold-but-unclaimed portion stays locked until each investor claims). This test
+      // sold only part of saleAmount, so claim the sold tokens too to reach a fully
+      // drained lock.
+      await launchpad.write.claimTokens([0n], { account: user1.account });
+
       // Locked amount should be 0
       const lockedAmount = await launchpad.read.lockedTokenAmount([tokenAddress]);
-      assert.strictEqual(lockedAmount, 0n, "Locked amount should be 0 after finalization");
+      assert.strictEqual(lockedAmount, 0n, "Locked amount should be 0 after finalization + claim");
     });
 
     it("should unlock tokens after cancellation", async function () {
@@ -541,7 +568,19 @@ describe("Security Tests", function () {
   });
 
   describe("Finalize Status Consistency Tests", function () {
-    it("should set Finalized status even with zero totalRaised", async function () {
+    // The softcap (MIN_RAISE_BP, 2000 = 20% of the target raise) instead of the earlier
+    // behavior this test used
+    // to pin. A launchpad with ZERO totalRaised can never clear a positive softcap
+    // threshold. `finalizeLaunchpad` no longer auto-cancels an underfunded raise into
+    // Cancelled — it REVERTS (`LaunchpadUnderfunded`), so "finalize succeeded" always
+    // implies "status == Finalized". The permissionless `cancelUnderfundedLaunchpad` is
+    // the function that now reaches the real terminal status (Cancelled) for an
+    // underfunded raise — see LaunchpadV1.test.ts "softcap ..." — a
+    // zero-participation launchpad past endTime". The original intent here —
+    // "finalize-side handling must reach a real terminal status, not get stuck
+    // mid-flow" — still holds: finalize itself reverts cleanly (no stuck state), and
+    // cancelUnderfundedLaunchpad reaches Cancelled.
+    it("finalizeLaunchpad reverts LaunchpadUnderfunded with zero totalRaised; cancelUnderfundedLaunchpad reaches the real terminal status (Cancelled) — never stuck mid-flow", async function () {
       const { launchpad, owner, usdt, issueSimpleToken } = await loadFixture(deploySecurityFixture);
 
       const { tokenAddress } = await issueSimpleToken(owner, "Test Token", "TEST");
@@ -568,16 +607,22 @@ describe("Security Tests", function () {
       // Move time past end by increasing the calculated duration
       await time.increase(timeToAdvance);
 
-      // Finalize with zero totalRaised
-      await launchpad.write.finalizeLaunchpad([0n], { account: owner.account });
+      // Finalize with zero totalRaised now reverts instead of silently succeeding.
+      await assertions.revertWithCustomError(
+        launchpad.write.finalizeLaunchpad([0n], { account: owner.account }),
+        launchpad,
+        "LaunchpadUnderfunded",
+      );
 
-      // Check status is Finalized (not Ended)
+      // Not stuck: the permissionless cancel path reaches the real terminal status.
+      await launchpad.write.cancelUnderfundedLaunchpad([0n]);
+
       const finalInfo = (await launchpad.read.getLaunchpadInfo([0n])) as { status: number };
-      // LaunchpadStatus.Finalized = 4
+      // LaunchpadStatus.Cancelled = 5
       assert.strictEqual(
         finalInfo.status,
-        4,
-        "Status should be Finalized (4) even with zero totalRaised",
+        5,
+        "Status should be Cancelled (5) with zero totalRaised under the softcap (MIN_RAISE_BP = 2000bp)",
       );
     });
   });

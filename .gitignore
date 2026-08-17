@@ -50,4 +50,9 @@ artifacts/
 # Misc
 *.tsbuildinfo
 
-.omc
+# Agent/tooling local state — never part of the audit package
+.claude/
+.omc/
+.codex/
+.omx/
+.mcp.json

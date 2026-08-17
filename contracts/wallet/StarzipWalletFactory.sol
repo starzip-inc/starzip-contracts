@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.30;
 
-import {ERC1967Proxy} from "../ERC1967Proxy.sol";
-import {StarzipWallet} from "./StarzipWallet.sol";
-import {IEntryPoint} from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
-import {Create2} from "@openzeppelin/contracts/utils/Create2.sol";
+import { ERC1967Proxy } from "../ERC1967Proxy.sol";
+import { StarzipWallet } from "./StarzipWallet.sol";
+import { IEntryPoint } from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
+import { Create2 } from "@openzeppelin/contracts/utils/Create2.sol";
 
 /**
  * @title StarzipWalletFactory
@@ -17,7 +17,12 @@ contract StarzipWalletFactory {
     IEntryPoint public immutable entryPoint;
 
     // ============ Events ============
-    event AccountCreated(address indexed account, bytes32 pubKeyX, bytes32 pubKeyY, uint256 salt);
+    /// @dev `owners` is the same `abi.encode`d owner-blob array `StarzipWallet.initialize`
+    ///      accepts — each element is `abi.encode(address)` (32 bytes) for an EOA-style owner, or
+    ///      `abi.encode(bytes32 x, bytes32 y)` (64 bytes) for a P-256 passkey owner. This is the
+    ///      full initial owner set, not a single first owner — see {StarzipWallet-initialize}'s
+    ///      NatSpec for why a wallet must not be born with only one owner.
+    event AccountCreated(address indexed account, bytes[] owners, uint256 salt);
 
     constructor(IEntryPoint _entryPoint) {
         entryPoint = _entryPoint;
@@ -25,39 +30,32 @@ contract StarzipWalletFactory {
     }
 
     // ============ Factory ============
-    function createAccount(
-        bytes32 pubKeyX,
-        bytes32 pubKeyY,
-        address owner,
-        uint256 salt
-    ) external returns (address) {
-        address predicted = getAddress(pubKeyX, pubKeyY, owner, salt);
+    /**
+     * @notice Deploy (or return the existing) wallet for `(owners, salt)`.
+     * @dev `owners` must be non-empty, and each element exactly 32 bytes
+     *      (`abi.encode(address)`) or 64 bytes (`abi.encode(bytes32 x, bytes32 y)`) —
+     *      `StarzipWallet.initialize` enforces the array-non-empty and per-element shape/validity
+     *      (non-zero address / on-curve passkey) checks; this factory does not duplicate that
+     *      validation, it only predicts and deploys. The full owner set is part of the initcode
+     *      (via `initData`, which participates in the CREATE2 address hash — see {getAddress}),
+     *      so the counterfactual address stays bound to the FULL owner set, not just one key: two
+     *      calls that differ only in a later element of `owners` predict and deploy to different
+     *      addresses, exactly as differing in `firstOwner` always did.
+     */
+    function createAccount(bytes[] calldata owners, uint256 salt) external returns (address) {
+        address predicted = getAddress(owners, salt);
         if (predicted.code.length > 0) return predicted;
 
-        bytes memory initData = abi.encodeCall(
-            StarzipWallet.initialize,
-            (pubKeyX, pubKeyY, owner)
-        );
+        bytes memory initData = abi.encodeCall(StarzipWallet.initialize, (owners));
 
-        ERC1967Proxy proxy = new ERC1967Proxy{salt: bytes32(salt)}(
-            address(accountImplementation),
-            initData
-        );
+        ERC1967Proxy proxy = new ERC1967Proxy{ salt: bytes32(salt) }(address(accountImplementation), initData);
 
-        emit AccountCreated(address(proxy), pubKeyX, pubKeyY, salt);
+        emit AccountCreated(address(proxy), owners, salt);
         return address(proxy);
     }
 
-    function getAddress(
-        bytes32 pubKeyX,
-        bytes32 pubKeyY,
-        address owner,
-        uint256 salt
-    ) public view returns (address) {
-        bytes memory initData = abi.encodeCall(
-            StarzipWallet.initialize,
-            (pubKeyX, pubKeyY, owner)
-        );
+    function getAddress(bytes[] calldata owners, uint256 salt) public view returns (address) {
+        bytes memory initData = abi.encodeCall(StarzipWallet.initialize, (owners));
 
         bytes memory proxyBytecode = abi.encodePacked(
             type(ERC1967Proxy).creationCode,

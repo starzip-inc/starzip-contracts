@@ -14,11 +14,14 @@ import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
  *         Store Token distribution model.
  * @dev BeaconProxy-clone deployed by `TokenFactory` at `issueToken` time.
  *      Vesting is **deferred**: `start` is set to `type(uint64).max` at init
- *      and only flipped by `LaunchpadV1.finalizeLaunchpad` via `startVesting`.
+ *      and flipped by the bound LaunchpadV1 on launch finalization/cancellation/
+ *      expiry, or by the issuing TokenFactory when unconsumed launch escrow is reclaimed.
  *
- * Two-role access control:
+ * Two-role activation control:
  *   - `owner()`     = beneficiary (business account). Can call `release()`.
- *   - `launchpad()` = the only address allowed to call `startVesting()`.
+ *   - `launchpad()` = launch lifecycle authority allowed to call `startVesting()`.
+ *   - the issuing TokenFactory (`factory()`) may also call `startVesting()` when its
+ *     launch escrow is reclaimed (with a legacy launchpad-binding fallback).
  *
  * @dev The wallet's `launchpad` binding is **permanently determined at initialize**.
  *      It cannot be changed post-init. Rotating the linked-launchpad binding requires
@@ -51,6 +54,7 @@ contract TokenVestingWallet is Initializable, Ownable2StepUpgradeable, Reentranc
         uint64 cliff; // cliff in seconds (0 = no cliff)
         bool started; // canonical "vesting started" flag
         uint256 released; // cumulative released to beneficiary
+        address factory; // issuing TokenFactory; fallback activator on escrow reclaim
     }
 
     /**
@@ -121,6 +125,7 @@ contract TokenVestingWallet is Initializable, Ownable2StepUpgradeable, Reentranc
         $.duration = duration_;
         $.cliff = cliff_;
         $.start = type(uint64).max; // sentinel: not yet started
+        $.factory = msg.sender; // issuing TokenFactory (BeaconProxy deployer)
         // $.started = false (default)
         // $.released = 0 (default)
     }
@@ -129,15 +134,38 @@ contract TokenVestingWallet is Initializable, Ownable2StepUpgradeable, Reentranc
 
     /**
      * @notice Flip the vesting wallet from "deferred" to "started".
-     * @dev Only callable once, only by the configured launchpad.
-     *      Hard-revert on retry: `ownerVestingTrigger` flag in LaunchpadV1 only
-     *      flips after this call succeeds, ensuring idempotency on retry.
-     * @param startTimestamp Vesting start time (typically `block.timestamp` at finalize).
+     * @dev Only callable once, by the configured launchpad or its issuing TokenFactory.
+     *      The launchpad triggers this on finalize/cancel/expire; the factory triggers
+     *      it when unconsumed launch escrow is reclaimed, so the funded owner allocation
+     *      is never permanently stranded on a terminal path.
+     * @param startTimestamp Vesting start time (typically `block.timestamp`).
      * @param duration_ Effective duration (overrides any factory-staged duration).
      */
     function startVesting(uint64 startTimestamp, uint64 duration_) external {
         VWStorage storage $ = _v();
-        if (msg.sender != $.launchpad) revert NotLaunchpad();
+        if (msg.sender != $.launchpad && msg.sender != $.factory) {
+            // Backward-compatible authorization for wallets initialized before the
+            // factory field was appended to namespaced storage: derive the factory from
+            // the launchpad binding. Fail closed if the launchpad has no code (never a
+            // real LaunchpadV1) so an unauthorized caller gets a deterministic revert.
+            //
+            // Gate the shim on the legacy condition it exists for. `$.factory` is set at
+            // init for every wallet deployed since the field was added, so without this check
+            // NEW wallets also fell through to the branch below — which resolves authority from
+            // `LaunchpadV1.tokenFactory`, a live mutable pointer, rather than from this wallet's
+            // own immutable binding. That is the pointer-consistency defect the per-object
+            // snapshots were introduced to close, leaking back in through a sibling contract.
+            // Rotating the launchpad's factory pointer would silently hand the incoming factory
+            // startVesting authority over every wallet issued by the outgoing one.
+            if ($.factory != address(0)) revert NotLaunchpad();
+            address boundLaunchpad = $.launchpad;
+            if (boundLaunchpad.code.length == 0) revert NotLaunchpad();
+            try ILaunchpadBinding(boundLaunchpad).tokenFactory() returns (address boundFactory) {
+                if (msg.sender != boundFactory) revert NotLaunchpad();
+            } catch {
+                revert NotLaunchpad();
+            }
+        }
         if ($.started) revert AlreadyStarted();
         if (duration_ == 0) revert InvalidDuration();
         if ($.cliff > duration_) revert InvalidCliff();
@@ -209,6 +237,10 @@ contract TokenVestingWallet is Initializable, Ownable2StepUpgradeable, Reentranc
         return _v().launchpad;
     }
 
+    function factory() external view returns (address) {
+        return _v().factory;
+    }
+
     function started() external view returns (bool) {
         return _v().started;
     }
@@ -224,4 +256,11 @@ contract TokenVestingWallet is Initializable, Ownable2StepUpgradeable, Reentranc
     function version() external pure returns (uint256) {
         return 1;
     }
+}
+
+/**
+ * @notice Minimal interface for authenticating the TokenFactory bound to the launchpad.
+ */
+interface ILaunchpadBinding {
+    function tokenFactory() external view returns (address);
 }

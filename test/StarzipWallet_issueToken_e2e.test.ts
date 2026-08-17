@@ -1,6 +1,6 @@
 /**
- * E2E harness: prove that a StarzipWallet whose address is
- * derived off-chain (computeSalt) is the SAME address actually deployed by
+ * E2E harness (member request, boss GO): prove that a StarzipWallet whose address
+ * member derives off-chain (computeSalt) is the SAME address actually deployed by
  * StarzipWalletFactory, and that this passkey wallet can drive TokenFactory.issueToken
  * end-to-end via a real ERC-4337 EntryPoint.handleOps with a real WebAuthn P-256 signature.
  *
@@ -10,11 +10,12 @@
  *                                   ->  TokenIssued (token deployed)            [full E2E]
  *
  * permitSigner workaround: harness deploys TokenFactory with a test secp256k1 signer
- * (a test signer); IssuePermit is ECDSA-signed by that test key.
+ * (no real KMS 0xd814 in tests); IssuePermit is ECDSA-signed by that test key.
  *
- * owner note: using owner=address(0) (passkey-only) is not supported — initialize REVERTS on
- * zero owner, so owner=0 is undeployable. A non-zero inert sentinel (0xdEaD) fixes this.
- * Happy-path E2E uses the sentinel.
+ * owner note: member's spec used owner=address(0) (passkey-only). initialize REVERTS on a
+ * zero-address EOA owner (see GAP-1); a passkey owner has no such analogue — the happy-path E2E
+ * simply registers the passkey itself as the wallet's first (and only) owner, exactly as
+ * StarzipWallet's multi-owner model intends (see StarzipWallet.sol's contract-level NatSpec).
  */
 import { describe, it } from "node:test";
 import assert from "node:assert";
@@ -34,7 +35,14 @@ import {
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { loadFixture, getConnection, time } from "./helpers.js";
-import { passkeyPubCoords, webauthnSignature, buildUserOp } from "./aa-helpers.js";
+import {
+  passkeyPubCoords,
+  webauthnSignature,
+  buildUserOp,
+  encodeAddressOwner,
+  encodePasskeyOwner,
+  encodeSignatureWrapper,
+} from "./aa-helpers.js";
 import {
   deployTokenFactoryCore,
   buildRatios,
@@ -51,11 +59,9 @@ const PASSKEY_PRIV = hexToBytes(
   "0xc9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721" as Hex,
 );
 const { x: PASSKEY_X, y: PASSKEY_Y } = passkeyPubCoords(PASSKEY_PRIV);
+const FIRST_OWNER = encodePasskeyOwner(PASSKEY_X, PASSKEY_Y);
 
-// inert owner sentinel (social-recovery v1)
-const OWNER_SENTINEL = "0x000000000000000000000000000000000000dEaD" as Address;
-
-// computeSalt: keccak256( keccak256("starzip.smartwallet.v1") || keccak256(uid) )
+// member computeSalt: keccak256( keccak256("starzip.smartwallet.v1") || keccak256(uid) )
 const SALT_DOMAIN_TAG = keccak256(toHex("starzip.smartwallet.v1"));
 const TEST_UID = "test-user-001";
 const MEMBER_SALT = keccak256(concatHex([SALT_DOMAIN_TAG, keccak256(toHex(TEST_UID))]));
@@ -63,7 +69,7 @@ const MEMBER_SALT_UINT = BigInt(MEMBER_SALT);
 
 const TOTAL_SUPPLY = parseUnits("1000000", 18);
 
-describe("StarzipWallet -> TokenFactory.issueToken (E2E)", function () {
+describe("StarzipWallet -> TokenFactory.issueToken (E2E, member request)", function () {
   async function deployFixture() {
     const { viem } = await getConnection();
     const [deployer, platformTreasury, beneficiary] = await viem.getWalletClients();
@@ -104,39 +110,33 @@ describe("StarzipWallet -> TokenFactory.issueToken (E2E)", function () {
     };
   }
 
-  it("getAddress(owner=0) computes, but createAccount(owner=0) reverts (ZeroAddress)", async function () {
+  it("GAP-1: getAddress(owner=0) computes, but createAccount(owner=0) reverts (ZeroAddress)", async function () {
     const { walletFactory, deployer } = await loadFixture(deployFixture);
+    const zeroOwner = encodeAddressOwner(zeroAddress);
     const phantom = (await walletFactory.read.getAddress([
-      PASSKEY_X,
-      PASSKEY_Y,
-      zeroAddress,
+      [zeroOwner],
       MEMBER_SALT_UINT,
     ])) as Address;
     assert.ok(phantom && phantom !== zeroAddress);
     await assert.rejects(
-      walletFactory.write.createAccount([PASSKEY_X, PASSKEY_Y, zeroAddress, MEMBER_SALT_UINT], {
+      walletFactory.write.createAccount([[zeroOwner], MEMBER_SALT_UINT], {
         account: deployer.account,
       }),
     );
     console.log(
-      `owner=0 phantom getAddress = ${phantom} (NOT deployable; createAccount reverts)`,
+      `[GAP-1] owner=0 phantom getAddress = ${phantom} (NOT deployable; createAccount reverts)`,
     );
   });
 
-  it("address parity: factory.getAddress == createAccount (deterministic salt, sentinel owner)", async function () {
+  it("address parity: factory.getAddress == createAccount (member salt, passkey owner)", async function () {
     const { walletFactory, deployer, publicClient } = await loadFixture(deployFixture);
     const predicted = (await walletFactory.read.getAddress([
-      PASSKEY_X,
-      PASSKEY_Y,
-      OWNER_SENTINEL,
+      [FIRST_OWNER],
       MEMBER_SALT_UINT,
     ])) as Address;
-    const hash = await walletFactory.write.createAccount(
-      [PASSKEY_X, PASSKEY_Y, OWNER_SENTINEL, MEMBER_SALT_UINT],
-      {
-        account: deployer.account,
-      },
-    );
+    const hash = await walletFactory.write.createAccount([[FIRST_OWNER], MEMBER_SALT_UINT], {
+      account: deployer.account,
+    });
     const receipt = await publicClient.waitForTransactionReceipt({ hash });
     const created = parseEventLogs({
       abi: walletFactory.abi,
@@ -163,17 +163,14 @@ describe("StarzipWallet -> TokenFactory.issueToken (E2E)", function () {
       linkedLaunchpad,
     } = await loadFixture(deployFixture);
 
-    // 1) deploy the passkey wallet at the derived address (sentinel owner)
+    // 1) deploy the passkey wallet at the member-derived address (passkey is the sole owner)
     const walletAddr = (await walletFactory.read.getAddress([
-      PASSKEY_X,
-      PASSKEY_Y,
-      OWNER_SENTINEL,
+      [FIRST_OWNER],
       MEMBER_SALT_UINT,
     ])) as Address;
-    await walletFactory.write.createAccount(
-      [PASSKEY_X, PASSKEY_Y, OWNER_SENTINEL, MEMBER_SALT_UINT],
-      { account: deployer.account },
-    );
+    await walletFactory.write.createAccount([[FIRST_OWNER], MEMBER_SALT_UINT], {
+      account: deployer.account,
+    });
 
     // 2) prefund for EntryPoint prefund
     await deployer.sendTransaction({ to: walletAddr, value: parseEther("2") });
@@ -225,7 +222,7 @@ describe("StarzipWallet -> TokenFactory.issueToken (E2E)", function () {
     const nonce = (await entryPoint.read.getNonce([walletAddr, 0n])) as bigint;
     const userOp = buildUserOp(walletAddr, nonce, callData);
     const userOpHash = (await entryPoint.read.getUserOpHash([userOp])) as Hex;
-    userOp.signature = webauthnSignature(userOpHash, PASSKEY_PRIV);
+    userOp.signature = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
 
     // 6) submit
     const hash = await entryPoint.write.handleOps([[userOp], beneficiary.account.address], {

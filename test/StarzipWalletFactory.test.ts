@@ -2,7 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import { getAddress, hexToBytes, Hex, zeroAddress } from "viem";
 import { loadFixture, getConnection } from "./helpers.js";
-import { passkeyPubCoords } from "./aa-helpers.js";
+import { passkeyPubCoords, encodePasskeyOwner, encodeAddressOwner } from "./aa-helpers.js";
 
 describe("StarzipWalletFactory", function () {
   // createAccount now validates the P256 pubkey is on-curve, so fixtures must be REAL
@@ -44,18 +44,11 @@ describe("StarzipWalletFactory", function () {
     it("should deploy account to predicted address", async function () {
       const { factory, owner, publicClient } = await loadFixture(deployFactoryFixture);
       const salt = 0n;
+      const owners = [encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y)];
 
-      const predicted = await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        owner.account.address,
-        salt,
-      ]);
+      const predicted = await factory.read.getAddress([owners, salt]);
 
-      const hash = await factory.write.createAccount(
-        [TEST_PUB_KEY_X, TEST_PUB_KEY_Y, owner.account.address, salt],
-        { account: owner.account },
-      );
+      const hash = await factory.write.createAccount([owners, salt], { account: owner.account });
       await publicClient.waitForTransactionReceipt({ hash });
 
       const code = await publicClient.getCode({ address: predicted as `0x${string}` });
@@ -65,36 +58,27 @@ describe("StarzipWalletFactory", function () {
     it("should be idempotent — second call returns same address", async function () {
       const { factory, owner, publicClient } = await loadFixture(deployFactoryFixture);
       const salt = 1n;
+      const owners = [encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y)];
 
-      const hash1 = await factory.write.createAccount(
-        [TEST_PUB_KEY_X, TEST_PUB_KEY_Y, owner.account.address, salt],
-        { account: owner.account },
-      );
+      const hash1 = await factory.write.createAccount([owners, salt], { account: owner.account });
       await publicClient.waitForTransactionReceipt({ hash: hash1 });
 
       // Second call should succeed (returns existing)
-      const hash2 = await factory.write.createAccount(
-        [TEST_PUB_KEY_X, TEST_PUB_KEY_Y, owner.account.address, salt],
-        { account: owner.account },
-      );
+      const hash2 = await factory.write.createAccount([owners, salt], { account: owner.account });
       const receipt = await publicClient.waitForTransactionReceipt({ hash: hash2 });
       assert.ok(receipt.status === "success");
     });
 
     it("should produce different addresses for different pubkeys", async function () {
-      const { factory, owner } = await loadFixture(deployFactoryFixture);
+      const { factory } = await loadFixture(deployFactoryFixture);
       const salt = 2n;
 
       const addr1 = await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        owner.account.address,
+        [encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y)],
         salt,
       ]);
       const addr2 = await factory.read.getAddress([
-        ALT_PUB_KEY_X,
-        ALT_PUB_KEY_Y,
-        owner.account.address,
+        [encodePasskeyOwner(ALT_PUB_KEY_X, ALT_PUB_KEY_Y)],
         salt,
       ]);
 
@@ -106,15 +90,11 @@ describe("StarzipWalletFactory", function () {
       const salt = 3n;
 
       const addr1 = await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        owner.account.address,
+        [encodeAddressOwner(owner.account.address)],
         salt,
       ]);
       const addr2 = await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        user1.account.address,
+        [encodeAddressOwner(user1.account.address)],
         salt,
       ]);
 
@@ -122,48 +102,74 @@ describe("StarzipWalletFactory", function () {
     });
 
     it("should produce different addresses for different salts", async function () {
-      const { factory, owner } = await loadFixture(deployFactoryFixture);
+      const { factory } = await loadFixture(deployFactoryFixture);
+      const owners = [encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y)];
 
-      const addr1 = await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        owner.account.address,
-        10n,
-      ]);
-      const addr2 = await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        owner.account.address,
-        20n,
-      ]);
+      const addr1 = await factory.read.getAddress([owners, 10n]);
+      const addr2 = await factory.read.getAddress([owners, 20n]);
 
       assert.notStrictEqual(addr1, addr2, "Different salts should produce different addresses");
+    });
+
+    it("should produce different addresses for a differing SECOND owner in the initial set (V2: full owner set is bound into the CREATE2 address)", async function () {
+      const { factory } = await loadFixture(deployFactoryFixture);
+      const salt = 5n;
+      const first = encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y);
+
+      const addr1 = await factory.read.getAddress([
+        [first, encodePasskeyOwner(ALT_PUB_KEY_X, ALT_PUB_KEY_Y)],
+        salt,
+      ]);
+      const addr2 = await factory.read.getAddress([
+        [first, encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y)],
+        salt,
+      ]);
+
+      assert.notStrictEqual(
+        addr1,
+        addr2,
+        "a different second owner (even with an identical first owner) must predict a different address",
+      );
     });
 
     it("should initialize deployed account correctly", async function () {
       const { factory, owner, publicClient, viem } = await loadFixture(deployFactoryFixture);
       const salt = 4n;
+      const firstOwner = encodeAddressOwner(owner.account.address);
+      const owners = [firstOwner];
 
-      const hash = await factory.write.createAccount(
-        [TEST_PUB_KEY_X, TEST_PUB_KEY_Y, owner.account.address, salt],
-        { account: owner.account },
-      );
+      const hash = await factory.write.createAccount([owners, salt], { account: owner.account });
       await publicClient.waitForTransactionReceipt({ hash });
 
-      const accountAddr = (await factory.read.getAddress([
-        TEST_PUB_KEY_X,
-        TEST_PUB_KEY_Y,
-        owner.account.address,
-        salt,
-      ])) as `0x${string}`;
+      const accountAddr = (await factory.read.getAddress([owners, salt])) as `0x${string}`;
 
       const account = await viem.getContractAt("StarzipWallet", accountAddr);
-      assert.strictEqual(await account.read.publicKeyX(), TEST_PUB_KEY_X);
-      assert.strictEqual(await account.read.publicKeyY(), TEST_PUB_KEY_Y);
-      assert.strictEqual(
-        getAddress((await account.read.owner()) as string),
-        getAddress(owner.account.address),
-      );
+      assert.strictEqual(await account.read.ownerAtIndex([0n]), firstOwner);
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 1n);
+    });
+
+    it("should register all owners in an INITIAL multi-owner set, in order (V2)", async function () {
+      const { factory, owner, publicClient, viem } = await loadFixture(deployFactoryFixture);
+      const salt = 6n;
+      const ownerA = encodeAddressOwner(owner.account.address);
+      const ownerB = encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y);
+      const owners = [ownerA, ownerB];
+
+      const hash = await factory.write.createAccount([owners, salt], { account: owner.account });
+      await publicClient.waitForTransactionReceipt({ hash });
+
+      const accountAddr = (await factory.read.getAddress([owners, salt])) as `0x${string}`;
+      const account = await viem.getContractAt("StarzipWallet", accountAddr);
+      assert.strictEqual(await account.read.ownerAtIndex([0n]), ownerA);
+      assert.strictEqual(await account.read.ownerAtIndex([1n]), ownerB);
+      assert.strictEqual((await account.read.ownerCount()) as bigint, 2n);
+      assert.strictEqual((await account.read.nextOwnerIndex()) as bigint, 2n);
+    });
+
+    it("createAccount reverts InvalidArrayLength for an empty owners array (V2: a wallet cannot be born ownerless)", async function () {
+      const { factory, owner } = await loadFixture(deployFactoryFixture);
+      const salt = 7n;
+      await assert.rejects(factory.write.createAccount([[], salt], { account: owner.account }));
     });
   });
 });

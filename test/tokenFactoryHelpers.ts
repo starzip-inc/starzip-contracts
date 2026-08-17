@@ -1,13 +1,13 @@
 /**
  * Shared test helpers for the 3-bucket `TokenFactory` / `LaunchpadV1` issuance flow
- * (LAUNCHPAD escrow, LIQUIDITY_RESERVE, OWNER_VESTING wallet;
+ * (GATE-0 G0-1 adopt-delta: LAUNCHPAD escrow, LIQUIDITY_RESERVE, OWNER_VESTING wallet;
  * the original design's OCT bucket was removed as part of the fixed-supply finalization).
  * Centralizes the boilerplate every consumer fixture needs:
  *   1. Deploy ERC20V1 beacon + TokenVestingWallet beacon + TokenFactory proxy.
  *   2. Configure allocation guides for all 3 buckets (2-day timelock, propose+execute).
  *   3. Configure `linkedLaunchpad` (2-day timelock, propose+execute).
  *   4. Sign + submit the 14-field `IssuePermit` (adds the 6 ratio fields +
- *      `linkedLaunchpad` on top of the original 7-field permit).
+ *      `linkedLaunchpad` on top of the pre-delta 7-field permit).
  *
  * Any test that only needs "a token exists, business holds a spendable balance" (ERC20V1,
  * Security, TradeSettlement* fixtures) should route LIQUIDITY_RESERVE to a neutral EOA
@@ -94,6 +94,19 @@ export async function setEscrowTimeout(
   await tokenFactory.write.proposeEscrowTimeoutChange([seconds], { account: owner.account });
   await time.increase(CONFIG_DELAY);
   await tokenFactory.write.executeEscrowTimeoutChange([], { account: owner.account });
+}
+
+/**
+ * Propose + advance + execute the resale-wait timeout (`resaleWaitSeconds`) — the
+ * cooldown `TokenFactory.restoreEscrow` imposes before a cancelled sale's returned token
+ * becomes resale-eligible again. Fail-closed like `setEscrowTimeout`: `restoreEscrow`
+ * reverts `ResaleWaitNotConfigured` while this is unset, so any fixture exercising
+ * `cancelLaunchpad`/`expireLaunchpad`/`cancelUnderfundedLaunchpad` must call this first.
+ */
+export async function setResaleWait(tokenFactory: any, owner: any, seconds: bigint): Promise<void> {
+  await tokenFactory.write.proposeResaleWaitChange([seconds], { account: owner.account });
+  await time.increase(CONFIG_DELAY);
+  await tokenFactory.write.executeResaleWaitChange([], { account: owner.account });
 }
 
 /** Deploy ERC20V1 beacon + TokenVestingWallet beacon + the TokenFactory proxy. */
@@ -305,7 +318,7 @@ export async function issueTokenWithRatios(params: {
  * + a `linkedLaunchpad` placeholder (any contract address — tests that don't exercise
  * escrow/vesting-trigger never call it), then issue a single token whose LIQUIDITY_RESERVE
  * bucket is routed to `neutralRecipient` and immediately forwarded to `business` so it
- * ends up holding the full non-escrowed supply (mirrors the "business holds
+ * ends up holding the full non-escrowed supply (mirrors the pre-delta "business holds
  * ~90% immediately" assumption most consumer fixtures were written against — the
  * self-deal guard blocks routing LIQUIDITY_RESERVE directly to `businessAccount`).
  *

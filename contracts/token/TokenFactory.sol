@@ -62,6 +62,12 @@ contract TokenFactory is
     /// @dev Timelock delay for staged UUPS upgrades.
     uint256 public constant UPGRADE_TIMELOCK_DELAY = 48 hours;
 
+    /// @dev A staged upgrade is executable only inside
+    ///      `[upgradeReadyAt, upgradeReadyAt + UPGRADE_GRACE_PERIOD]`. Matches TradeSettlementV1
+    ///      and UpgradeableBeacon; without it the 48h notice is a one-time announcement rather than
+    ///      a standing requirement.
+    uint256 public constant UPGRADE_GRACE_PERIOD = 7 days;
+
     uint8 public constant ALLOCATION_BUCKET_COUNT = 3;
     uint8 public constant BUCKET_LAUNCHPAD = 0;
     uint8 public constant BUCKET_LIQUIDITY_RESERVE = 1;
@@ -160,10 +166,13 @@ contract TokenFactory is
     ///         was never created for this token. `issuedAt + escrowTimeoutSeconds`.
     mapping(address => uint256) public escrowDeadline;
 
-    /// @notice One-shot consumption flag: true after either `releaseEscrow` or
-    ///         `reclaimEscrow` succeeds. Blocks double-release / double-reclaim and
-    ///         (transitively, via `releaseEscrow`) a second `createLaunchpad` for the
-    ///         same token.
+    /// @notice Consumption flag: true after `releaseEscrow` or `reclaimEscrow` succeeds, false
+    ///         again after `restoreEscrow` re-funds it. Blocks double-release / double-reclaim
+    ///         and (transitively, via `releaseEscrow`) a second `createLaunchpad` while a sale
+    ///         is live for the same token.
+    /// @dev NOT one-shot anymore: `restoreEscrow` clears this back to
+    ///      `false` when a cancelled launchpad returns its unsold `saleAmount` to escrow,
+    ///      making the token resellable — see {restoreEscrow}'s own doc comment.
     mapping(address => bool) public escrowConsumed;
 
     /// @notice Reclaim timeout applied to newly-issued tokens (placeholder 0 — see
@@ -179,9 +188,43 @@ contract TokenFactory is
     address public pendingImplementation;
     uint256 public upgradeReadyAt;
 
+    /// @notice Per-token launchpad binding captured at issuance. Escrow release and
+    ///         blacklist exemptions resolve through this immutable workflow binding,
+    ///         not the mutable global `linkedLaunchpad` pointer.
+    mapping(address => address) public tokenToLaunchpad;
+
+    /// @notice Trade settlement endpoints remain authorized after rotation so they
+    ///         can complete withdrawals for balances deposited before the change.
+    mapping(address => bool) public authorizedTradeSettlements;
+
+    /// @notice Resale-wait timeout applied when `restoreEscrow` returns a cancelled sale's
+    ///         unsold LAUNCHPAD-bucket tokens to escrow: the token cannot be
+    ///         resold via `LaunchpadV1.createLaunchpad` until `block.timestamp` clears the
+    ///         `escrowDeadline` that call sets (`restoreEscrow`-time + `resaleWaitSeconds`).
+    ///         Same fail-closed/timelocked pattern as `escrowTimeoutSeconds` (placeholder 0
+    ///         until configured; `restoreEscrow` reverts while unset — see that function) and
+    ///         reuses its `MIN_ESCROW_TIMEOUT`/`MAX_ESCROW_TIMEOUT` structural bounds: both are
+    ///         "how long a token sits in this factory's custody before someone can act on it"
+    ///         knobs.
+    uint256 public resaleWaitSeconds;
+    uint256 public pendingResaleWaitSeconds;
+    uint256 public resaleWaitChangeTime;
+
+    /// @notice True once `restoreEscrow` has ever re-funded `token`'s escrow — gates
+    ///         `releaseEscrow`'s resale-wait check (see that function). A token's FIRST sale
+    ///         still releases immediately after issuance (no wait — matches the earlier
+    ///         behavior); only a RESALE (this flag true) must wait out `escrowDeadline`.
+    ///         Never cleared back to `false` once set: after a token's first cancellation,
+    ///         every subsequent cycle for it is a resale by definition.
+    mapping(address => bool) public escrowIsResale;
+
     // ============ Storage Gap ============
     // Reserved storage slots for future upgrades — do not reorder or reuse.
-    uint256[27] private __gap; // was [31]; -4 (setTradeSettlement timelock +2, upgrade timelock staging +2)
+    // Resale-wait change (this change): consumed 4 further slots (`resaleWaitSeconds` +
+    // `pendingResaleWaitSeconds` + `resaleWaitChangeTime` + `escrowIsResale`) from the same
+    // gap — [23] -> [19]. Fresh-redeploy premise (see LaunchpadV1's own gap comment) — not an
+    // append-only constraint on an already-live proxy.
+    uint256[19] private __gap; // was [25]; -2 (timelocked upgrade staging) -4 (resale wait)
 
     // ============ Events ============
 
@@ -244,17 +287,27 @@ contract TokenFactory is
     event LaunchpadEscrowFunded(address indexed token, uint256 amount, uint256 deadline);
     event LaunchpadEscrowReleased(address indexed token, address indexed launchpad, uint256 amount);
     event LaunchpadEscrowReclaimed(address indexed token, address indexed business, uint256 amount);
+    /// @dev A cancelled sale's unsold tokens returning to escrow, resale-eligible after
+    ///      `deadline`.
+    event LaunchpadEscrowRestored(address indexed token, address indexed launchpad, uint256 amount, uint256 deadline);
+    /// @dev Permissionless (`triggerOwnerVesting`) Owner Vesting start, distinct from the
+    ///      ordinary `reclaimEscrow`-triggered path — same wallet, different caller/trigger.
+    event OwnerVestingTriggeredOnTimeout(address indexed token, address indexed vestingWallet);
 
     event EscrowTimeoutChangeProposed(uint256 newTimeoutSeconds, uint256 executeTime);
     event EscrowTimeoutChangeExecuted(uint256 oldTimeoutSeconds, uint256 newTimeoutSeconds);
     event EscrowTimeoutChangeCancelled(uint256 cancelledTimeoutSeconds);
+
+    event ResaleWaitChangeProposed(uint256 newWaitSeconds, uint256 executeTime);
+    event ResaleWaitChangeExecuted(uint256 oldWaitSeconds, uint256 newWaitSeconds);
+    event ResaleWaitChangeCancelled(uint256 cancelledWaitSeconds);
 
     // setTradeSettlement 2-day timelock events
     event TradeSettlementChangeProposed(address indexed newSettlement, uint256 executeTime);
     event TradeSettlementChangeExecuted(address indexed oldSettlement, address indexed newSettlement);
     event TradeSettlementChangeCancelled(address indexed cancelledSettlement);
 
-    // timelocked upgrade events
+    // Timelocked upgrade events
     event UpgradeRequested(address indexed newImplementation, uint256 readyAt);
     event UpgradeCancelled(address indexed cancelledImplementation);
 
@@ -299,13 +352,35 @@ contract TokenFactory is
     ///      timeout (>= MIN_ESCROW_TIMEOUT via the timelocked setter) first.
     error EscrowTimeoutNotConfigured();
 
+    // Resale errors
+    /// @dev Fail-closed, same shape as `EscrowTimeoutNotConfigured`: `restoreEscrow` refuses to
+    ///      re-fund escrow while `resaleWaitSeconds` is still 0 (unset) — otherwise the returned
+    ///      token would be resale-eligible immediately, defeating the mandated wait period.
+    error ResaleWaitNotConfigured();
+    error InvalidResaleWait();
+    /// @dev `restoreEscrow`'s own balanceBefore/After guard — the measured transferFrom delta
+    ///      did not match the caller-declared `amount` (mirrors `LaunchpadV1.createLaunchpad`'s
+    ///      `EscrowAmountMismatch` on the release leg).
+    error EscrowRestoreMismatch();
+
     // setTradeSettlement timelock error
     error TradeSettlementAlreadySet();
 
-    // timelocked upgrade errors
+    // Timelocked upgrade errors
     error NoPendingUpgrade();
     error ImplementationMismatch();
     error UpgradeNotReady();
+
+    /// @dev The staged upgrade matured more than UPGRADE_GRACE_PERIOD ago and is stale.
+    error UpgradeExpired();
+
+    /// @dev Ownership renouncement is disabled — see {renounceOwnership}.
+    error RenounceDisabled();
+
+    /// @dev An issued token belongs to the business that issued it. The platform has no
+    ///      path to move it — `transferTokenOwnership` exists only to say so out loud to
+    ///      callers holding an old ABI.
+    error TokenOwnershipIsBusinessOwned();
 
     // ============ Modifiers ============
 
@@ -467,6 +542,7 @@ contract TokenFactory is
         tokenIssuedAt[tokenAddress] = block.timestamp;
         tokenById[tokenId] = tokenAddress;
         tokenToVestingWallet[tokenAddress] = vestingWallet;
+        tokenToLaunchpad[tokenAddress] = currentLinkedLaunchpad;
 
         // ---- 8. 3-way distribution ----
         uint256 liquidityAmount = Math.mulDiv(_totalSupply, _ratios.liquidityBp, BASIS_POINTS);
@@ -482,8 +558,9 @@ contract TokenFactory is
         }
 
         // LAUNCHPAD bucket stays in factory custody as escrow — NOT transferred
-        // to the business. Consumed exactly once via `releaseEscrow` (createLaunchpad)
-        // or `reclaimEscrow` (timeout, business).
+        // to the business. Consumed via `releaseEscrow` (createLaunchpad) or `reclaimEscrow`
+        // (timeout, business); may be re-funded by `restoreEscrow` if a launchpad created
+        // against it is later cancelled, making the token resale-eligible.
         if (launchpadAmount > 0) {
             // Fail-closed: without a configured timeout, escrowDeadline == block.timestamp and the
             // business could reclaimEscrow the LAUNCHPAD bucket immediately, defeating escrow custody.
@@ -492,6 +569,29 @@ contract TokenFactory is
             launchpadEscrow[tokenAddress] = launchpadAmount;
             escrowDeadline[tokenAddress] = deadline;
             emit LaunchpadEscrowFunded(tokenAddress, launchpadAmount, deadline);
+        } else {
+            // launchpadAmount == 0 only when launchpadBp == 0 exactly — mulDiv's floor rounding
+            // can only roll MORE into this remainder, never produce a false zero for
+            // launchpadBp > 0 (covered by "rounding cannot produce a zero launchpadAmount for
+            // launchpadBp > 0" in the TokenFactory suite). With no LAUNCHPAD bucket funded, no escrow ever exists
+            // for this token, so neither `LaunchpadV1.createLaunchpad` (requires escrowAmount > 0)
+            // nor this contract's own `reclaimEscrow` (requires launchpadEscrow[token] > 0) can
+            // ever run for it — those are the ONLY two callers of `startVesting` on this token's
+            // wallet. Without this branch, a funded OWNER_VESTING allocation would be stranded in
+            // the deferred (`start == type(uint64).max`) state permanently — an ops footgun, not
+            // an attacker-reachable path. Start the wallet immediately instead: this factory is
+            // already its registered `factory()` authority (set to msg.sender == this contract at
+            // `initialize` time, a few lines above via `_deployVestingWallet`), the same
+            // authorization channel `reclaimEscrow` uses for its own equivalent trigger.
+            ITokenVestingWallet(vestingWallet).startVesting(uint64(block.timestamp), _ratios.ownerVestingDuration);
+
+            // Considered and deliberately NOT applied here. Setting `escrowConsumed = true` in
+            // this branch would make `getEscrowInfo` read more honestly for a token that can never
+            // launch — but it also changes which error `reclaimEscrow` reverts with, from
+            // `NoEscrowForToken` to `EscrowAlreadyConsumed`, because the consumed check runs first.
+            // That is a downstream-visible selector change (collector / member / frontend all decode
+            // these) in exchange for a cosmetic reporting improvement, and `amount == 0` already
+            // answers "can this token still launch?" on its own. Not worth the break.
         }
 
         emit VestingWalletDeployed(tokenAddress, vestingWallet, ownerAmount);
@@ -527,21 +627,32 @@ contract TokenFactory is
     // ============ Escrow release / reclaim ============
 
     /**
-     * @notice Release the LAUNCHPAD-bucket escrow for `token` to the caller.
-     * @dev Callable ONLY by the current `linkedLaunchpad` (this reuses the existing
-     *      2-day-timelocked pointer — no separate authorization channel).
-     *      One-shot: reverts `EscrowAlreadyConsumed` on a second call for the same
-     *      token, which transitively blocks a second `createLaunchpad` for it.
+     * @notice Release the LAUNCHPAD-bucket escrow for `token` to its issuance-time launchpad.
+     * @dev The per-token binding is immutable for the workflow. The current global
+     *      `linkedLaunchpad` is only the default for newly issued tokens.
+     *      Reverts `EscrowAlreadyConsumed` on a second call while escrow is already
+     *      consumed, which transitively blocks a second `createLaunchpad` while a sale is
+     *      live for it — NOT one-shot forever anymore: `restoreEscrow` can re-fund escrow
+     *      after a cancelled sale, making a further `releaseEscrow` call possible again.
+     *
+     * Resale wait: a token's FIRST release (fresh issuance) is immediate, same as
+     *      always. A RESALE (escrow re-funded by `restoreEscrow` — see `escrowIsResale`)
+     *      instead reverts `EscrowTimeoutNotElapsed` until `block.timestamp` clears the
+     *      `escrowDeadline` `restoreEscrow` set — that IS the mandated resale-wait period.
      * @return amount The amount released.
      */
     function releaseEscrow(address token) external nonReentrant returns (uint256 amount) {
-        if (msg.sender != linkedLaunchpad) revert NotLinkedLaunchpad();
+        if (msg.sender != _launchpadForToken(token)) revert NotLinkedLaunchpad();
         if (escrowConsumed[token]) revert EscrowAlreadyConsumed();
         amount = launchpadEscrow[token];
         if (amount == 0) revert NoEscrowForToken();
+        if (escrowIsResale[token] && block.timestamp < escrowDeadline[token]) {
+            revert EscrowTimeoutNotElapsed();
+        }
 
         escrowConsumed[token] = true;
         launchpadEscrow[token] = 0;
+        escrowDeadline[token] = 0; // clear the whole escrow record, not two thirds of it
 
         IERC20(token).safeTransfer(msg.sender, amount);
 
@@ -565,13 +676,105 @@ contract TokenFactory is
 
         escrowConsumed[token] = true;
         launchpadEscrow[token] = 0;
+        escrowDeadline[token] = 0; // clear the whole escrow record, not two thirds of it
+
+        // No launch will ever finalize this token now, so the launchpad's Owner Vesting
+        // trigger can never fire. Start the funded owner vesting wallet directly (the
+        // factory is authorized via the wallet's stored `factory` binding) so the owner
+        // allocation is not permanently frozen in the deferred/unstarted state.
+        //
+        // Guard: `started()` may already be true here — e.g. a prior cancelled sale's
+        // `triggerOwnerVesting` timeout fired before this reclaim did. `startVesting` itself
+        // hard-reverts on a second call (`AlreadyStarted`, no reset path), so without this
+        // guard a legitimate reclaim would revert.
+        address vestingWallet = tokenToVestingWallet[token];
+        if (vestingWallet != address(0) && !ITokenVestingWallet(vestingWallet).started()) {
+            uint64 vestingDuration = ITokenVestingWallet(vestingWallet).duration();
+            ITokenVestingWallet(vestingWallet).startVesting(uint64(block.timestamp), vestingDuration);
+        }
 
         IERC20(token).safeTransfer(business, amount);
 
         emit LaunchpadEscrowReclaimed(token, business, amount);
     }
 
+    /**
+     * @notice Restore a cancelled sale's unsold LAUNCHPAD-bucket `saleAmount` tokens to this
+     *         factory's escrow, resale-eligible via a future `LaunchpadV1.createLaunchpad`
+     *         once `resaleWaitSeconds` elapses (a cancelled sale's token
+     *         used to be permanently unsellable: `escrowConsumed` never reset, and
+     *         `TokenVestingWallet.startVesting` has no reset path once fired).
+     * @dev Callable only by `token`'s authorized launchpad workflow (`_launchpadForToken`,
+     *      the same authorization channel `releaseEscrow` uses). Pulls `amount` from the
+     *      caller via `transferFrom` — the caller must `approve` this factory first — and
+     *      verifies the REAL balance delta before crediting the ledger, mirroring
+     *      `LaunchpadV1.createLaunchpad`'s own balanceBefore/After discipline on the release
+     *      leg so `launchpadEscrow` can never diverge from the tokens this factory actually
+     *      holds.
+     * @return deadline The new resale-wait deadline (`block.timestamp + resaleWaitSeconds`).
+     */
+    function restoreEscrow(address token, uint256 amount) external nonReentrant returns (uint256 deadline) {
+        if (msg.sender != _launchpadForToken(token)) revert NotLinkedLaunchpad();
+        if (amount == 0) revert NoEscrowForToken();
+        if (resaleWaitSeconds == 0) revert ResaleWaitNotConfigured();
+
+        uint256 balanceBefore = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - balanceBefore;
+        if (received != amount) revert EscrowRestoreMismatch();
+
+        deadline = block.timestamp + resaleWaitSeconds;
+        launchpadEscrow[token] += received;
+        escrowDeadline[token] = deadline;
+        escrowConsumed[token] = false;
+        escrowIsResale[token] = true;
+
+        emit LaunchpadEscrowRestored(token, msg.sender, received, deadline);
+    }
+
+    /**
+     * @notice Permissionlessly start `token`'s Owner Vesting wallet once its LAUNCHPAD escrow
+     *         has sat unconsumed past `escrowDeadline` — mirrors
+     *         `LaunchpadV1.expireLaunchpad`'s permissionless pattern, applied here because
+     *         `LaunchpadV1` no longer triggers Owner Vesting on ANY cancel path (only on a
+     *         successful `finalizeLaunchpad`): a business that cancels a sale and never
+     *         returns (whether the escrow was ever consumed, or restored after a cancel and
+     *         never resold) must not freeze the funded owner allocation forever.
+     * @dev No-ops (does not revert) if vesting already started, so a caller can call this
+     *      speculatively without needing to check state first.
+     */
+    function triggerOwnerVesting(address token) external nonReentrant {
+        address vestingWallet = tokenToVestingWallet[token];
+        if (vestingWallet == address(0)) revert NoEscrowForToken();
+        if (ITokenVestingWallet(vestingWallet).started()) return;
+
+        if (escrowConsumed[token]) revert EscrowAlreadyConsumed();
+        uint256 deadline = escrowDeadline[token];
+        if (deadline == 0 || block.timestamp <= deadline) revert EscrowTimeoutNotElapsed();
+
+        uint64 vestingDuration = ITokenVestingWallet(vestingWallet).duration();
+        ITokenVestingWallet(vestingWallet).startVesting(uint64(block.timestamp), vestingDuration);
+
+        emit OwnerVestingTriggeredOnTimeout(token, vestingWallet);
+    }
+
     // ============ Internal Helpers ============
+
+    /// @dev Resolve the authoritative launchpad for a token's workflow: the immutable
+    ///      issuance-time binding, never the mutable global `linkedLaunchpad` pointer.
+    function _launchpadForToken(address token) internal view returns (address authorizedLaunchpad) {
+        authorizedLaunchpad = tokenToLaunchpad[token];
+        if (authorizedLaunchpad != address(0)) return authorizedLaunchpad;
+
+        // Upgrade compatibility for tokens issued before tokenToLaunchpad existed:
+        // their vesting wallet retains the authoritative issuance-time launchpad.
+        address vestingWallet = tokenToVestingWallet[token];
+        if (vestingWallet != address(0)) {
+            try ITokenVestingWallet(vestingWallet).launchpad() returns (address walletLaunchpad) {
+                return walletLaunchpad;
+            } catch {}
+        }
+    }
 
     function _validateRatios(AllocationRatios calldata _ratios) internal view {
         uint256 sumBp = uint256(_ratios.launchpadBp) + uint256(_ratios.liquidityBp) + uint256(_ratios.ownerBp);
@@ -689,9 +892,8 @@ contract TokenFactory is
     function isPlatformContract(address token, address who) external view returns (bool) {
         if (who == address(0)) return false;
         if (who == address(this)) return true; // TokenFactory (issuance/escrow legs)
-        if (who == linkedLaunchpad) return true; // LaunchpadV1 (escrow release, claim)
-        address settlement = tradeSettlement;
-        if (settlement != address(0) && who == settlement) return true; // TradeSettlement withdraw
+        if (who == _launchpadForToken(token)) return true; // issuance-time LaunchpadV1
+        if (who == tradeSettlement || authorizedTradeSettlements[who]) return true; // current or historical settlement
         if (who == tokenToVestingWallet[token]) return true; // this token's vesting wallet
         return false;
     }
@@ -871,6 +1073,40 @@ contract TokenFactory is
         emit EscrowTimeoutChangeCancelled(cancelled);
     }
 
+    // ============ Timelock: Resale Wait (2-day) ============
+
+    /// @notice Propose `resaleWaitSeconds` (the wait `restoreEscrow` imposes before a
+    ///         cancelled sale's returned token becomes resale-eligible). Same structural
+    ///         bounds as `proposeEscrowTimeoutChange` — see {resaleWaitSeconds}'s doc comment.
+    function proposeResaleWaitChange(uint256 _newWaitSeconds) external onlyOwner {
+        if (_newWaitSeconds < MIN_ESCROW_TIMEOUT || _newWaitSeconds > MAX_ESCROW_TIMEOUT) {
+            revert InvalidResaleWait();
+        }
+        pendingResaleWaitSeconds = _newWaitSeconds;
+        resaleWaitChangeTime = block.timestamp + CONFIG_DELAY;
+        emit ResaleWaitChangeProposed(_newWaitSeconds, resaleWaitChangeTime);
+    }
+
+    function executeResaleWaitChange() external onlyOwner {
+        if (resaleWaitChangeTime == 0) revert NoPendingChange();
+        if (block.timestamp < resaleWaitChangeTime) revert TimelockNotReady();
+
+        uint256 oldWait = resaleWaitSeconds;
+        resaleWaitSeconds = pendingResaleWaitSeconds;
+        pendingResaleWaitSeconds = 0;
+        resaleWaitChangeTime = 0;
+
+        emit ResaleWaitChangeExecuted(oldWait, resaleWaitSeconds);
+    }
+
+    function cancelResaleWaitChange() external onlyOwner {
+        if (resaleWaitChangeTime == 0) revert NoPendingChange();
+        uint256 cancelled = pendingResaleWaitSeconds;
+        pendingResaleWaitSeconds = 0;
+        resaleWaitChangeTime = 0;
+        emit ResaleWaitChangeCancelled(cancelled);
+    }
+
     // ============ Timelock: Beacon Change ============
 
     function proposeBeaconChange(address _newBeacon) external onlyOwner validAddress(_newBeacon) {
@@ -980,6 +1216,9 @@ contract TokenFactory is
         if (block.timestamp < tradeSettlementChangeTime) revert TimelockNotReady();
 
         address oldSettlement = tradeSettlement;
+        if (oldSettlement != address(0)) {
+            authorizedTradeSettlements[oldSettlement] = true;
+        }
         tradeSettlement = pendingTradeSettlement;
         pendingTradeSettlement = address(0);
         tradeSettlementChangeTime = 0;
@@ -1002,12 +1241,28 @@ contract TokenFactory is
         emit AutoListOnExchangeUpdated(oldValue, _autoList);
     }
 
-    function transferTokenOwnership(
-        address _tokenAddress,
-        address _newOwner
-    ) external onlyOwner validAddress(_tokenAddress) validAddress(_newOwner) {
-        if (!isIssuedToken[_tokenAddress]) revert TokenIssuanceFailed();
-        ERC20V1(_tokenAddress).transferOwnershipDirect(_newOwner);
+    /**
+     * @notice DEPRECATED — this selector always reverts. It transfers nothing and changes
+     *         no state.
+     * @dev The platform cannot move an issued token's ownership at all. An issued token
+     *      belongs to the business that issued it: `issueToken` hands ownership over at
+     *      mint time and nothing here takes it back.
+     *
+     *      This previously existed as an immediate transfer, then as a 2-day-timelocked
+     *      propose/execute/cancel flow. Both were seizure paths — they moved a business's
+     *      token to an address the platform chose, without that business's consent, and
+     *      the timelock only bought the business advance notice of it. Both are gone.
+     *
+     *      The selector is kept as a loud revert so a caller that still has it in an old
+     *      ABI gets a readable reason instead of an opaque "no matching function". A
+     *      business that wants to move its own token calls `transferOwnership` /
+     *      `acceptOwnership` on the token itself — `ERC20V1` is `Ownable2Step`, and that
+     *      path never routed through this contract.
+     *
+     *      Both parameters are intentionally unnamed/unused — nothing is read or written.
+     */
+    function transferTokenOwnership(address, address) external pure {
+        revert TokenOwnershipIsBusinessOwned();
     }
 
     /**
@@ -1031,13 +1286,51 @@ contract TokenFactory is
         upgradeReadyAt = 0;
     }
 
+    /**
+     * @dev Timelocked upgrade authorizer. The staged implementation must match, the timelock must
+     *      have elapsed, and the staging must not have expired. The staging is single-use
+     *      (cleared here).
+     */
     function _authorizeUpgrade(address newImplementation) internal override onlyOwner {
         if (pendingImplementation == address(0)) revert NoPendingUpgrade();
         if (newImplementation != pendingImplementation) revert ImplementationMismatch();
         if (block.timestamp < upgradeReadyAt) revert UpgradeNotReady();
+        if (block.timestamp > upgradeReadyAt + UPGRADE_GRACE_PERIOD) revert UpgradeExpired();
         if (newImplementation.code.length == 0) revert InvalidImplementation();
         pendingImplementation = address(0);
         upgradeReadyAt = 0;
+    }
+
+    /**
+     * @dev Ownership handover drops any armed upgrade staging.
+     *
+     *      Ownership actually moves here, on `acceptOwnership` (and on `renounceOwnership`), not on
+     *      the nomination. Without this an incoming owner inherits a matured implementation staged
+     *      by their predecessor and can install it with zero fresh notice. Clearing forces a
+     *      re-stage under the new key, restarting the 48h notice.
+     *
+     *      There is no per-token ownership-transfer staging to sweep here — the platform has no
+     *      path to move an issued token's ownership at all (see `transferTokenOwnership` above).
+     */
+    function _transferOwnership(address newOwner) internal virtual override {
+        if (pendingImplementation != address(0)) {
+            emit UpgradeCancelled(pendingImplementation);
+            pendingImplementation = address(0);
+            upgradeReadyAt = 0;
+        }
+        super._transferOwnership(newOwner);
+    }
+
+    /**
+     * @notice Renouncing ownership is permanently disabled.
+     * @dev Every lever this factory owns — the ERC20 and vesting-wallet beacons, the treasury, the
+     *      permit signer, the linked launchpad, the escrow timeout, and its own implementation —
+     *      is `onlyOwner` and timelocked. An ownerless factory freezes all of them permanently
+     *      while continuing to issue tokens against whatever configuration was last set. Ownership
+     *      moves only via the 2-step transfer, which always leaves a live owner.
+     */
+    function renounceOwnership() public view override onlyOwner {
+        revert RenounceDisabled();
     }
 }
 
@@ -1056,4 +1349,6 @@ interface ITradeSettlement {
 interface ITokenVestingWallet {
     function startVesting(uint64 startTimestamp, uint64 duration_) external;
     function duration() external view returns (uint64);
+    function launchpad() external view returns (address);
+    function started() external view returns (bool);
 }

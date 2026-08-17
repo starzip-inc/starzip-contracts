@@ -1,5 +1,5 @@
 /**
- * TokenVestingWallet unit tests
+ * TokenVestingWallet — unit tests
  *
  * Covers:
  *   - ERC-7201 storage location derivation (release-blocker, deep-audit P1-1)
