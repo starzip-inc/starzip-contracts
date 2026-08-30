@@ -65,7 +65,7 @@ async function deployFixture() {
   const chainId = await publicClient.getChainId();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
   const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
   await factory.write.createAccount([[firstOwner], SALT], { account: deployer.account });
@@ -304,7 +304,7 @@ async function passthroughOwnerFixture() {
   const [deployer] = await viem.getWalletClients();
   const publicClient = await viem.getPublicClient();
   const pep = await viem.deployContract("PassthroughEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [pep.address]);
+  const factory = await viem.deployContract("StarzipWalletFactory", [pep.address, zeroAddress]);
   const salt = 20260811n;
   const initialOwners: Hex[] = [
     encodePasskeyOwner(PK_X, PK_Y),
@@ -485,7 +485,7 @@ describe("StarzipWallet — adversarial review", function () {
       const publicClient = await viem.getPublicClient();
 
       const pep = await viem.deployContract("PassthroughEntryPoint", []);
-      const factory = await viem.deployContract("StarzipWalletFactory", [pep.address]);
+      const factory = await viem.deployContract("StarzipWalletFactory", [pep.address, zeroAddress]);
       const owner = encodePasskeyOwner(PK_X, PK_Y);
       await factory.write.createAccount([[owner], SALT], { account: deployer.account });
       const walletAddr = (await factory.read.getAddress([[owner], SALT])) as Address;

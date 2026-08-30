@@ -16,8 +16,17 @@
  */
 import { describe, it } from "node:test";
 import assert from "node:assert";
-import { encodeAbiParameters, getAddress, pad, parseEther, toHex, type Address } from "viem";
+import {
+  encodeAbiParameters,
+  getAddress,
+  pad,
+  parseEther,
+  toHex,
+  zeroAddress,
+  type Address,
+} from "viem";
 import { loadFixture, getConnection } from "./helpers.js";
+import { SPONSOR_SIGNER } from "./aa-helpers.js";
 
 const FRESH_WALLET = getAddress(pad(toHex(0xc0ffeen), { size: 20 }));
 const SPONSORED_WALLET = getAddress(pad(toHex(0xbeef01n), { size: 20 }));
@@ -36,6 +45,8 @@ async function deployFixture() {
   const paymaster = await viem.deployContract("VerifyingPaymaster", [
     probe.address,
     policyManagerWallet.account.address,
+    zeroAddress,
+    SPONSOR_SIGNER,
   ]);
 
   const ownerWrite = async (fn: string, args: unknown[]) => {
@@ -48,6 +59,15 @@ async function deployFixture() {
     });
     await publicClient.waitForTransactionReceipt({ hash });
   };
+
+  const stub = await viem.deployContract("TrustedPaymasterStub", [paymaster.address]);
+  const stubCode = await publicClient.getCode({ address: stub.address });
+  for (const target of [SPONSORED_WALLET, LATCHING_WALLET, VIP_LATCHING_WALLET]) {
+    await publicClient.request({
+      method: "hardhat_setCode" as any,
+      params: [target, stubCode] as any,
+    } as any);
+  }
 
   await ownerWrite("setGlobalDailyCapCeiling", [parseEther("1")]);
 
@@ -69,6 +89,7 @@ async function deployFixture() {
 
 type Ctx = Awaited<ReturnType<typeof deployFixture>>;
 
+
 async function measure(ctx: Ctx, wallet: Address): Promise<bigint> {
   const context = encodeAbiParameters([{ type: "address" }], [wallet]);
   // opSucceeded=0; `_postOp` ignores `mode` so the cost is identical for opReverted.
@@ -83,7 +104,7 @@ async function measure(ctx: Ctx, wallet: Address): Promise<bigint> {
 }
 
 describe("VerifyingPaymaster._postOp — empirical cold-path gas", function () {
-  it("every reachable _postOp branch stays under MIN_POSTOP_GAS, and the unprovisioned wallet remains the worst case", async function () {
+  it("every reachable _postOp branch stays under MIN_POSTOP_GAS; the probe-only unprovisioned case remains the (unreachable, deliberately conservative) measured ceiling", async function () {
     const ctx = await loadFixture(deployFixture);
 
     const unprovisioned = await measure(ctx, FRESH_WALLET);
@@ -94,11 +115,12 @@ describe("VerifyingPaymaster._postOp — empirical cold-path gas", function () {
     const minPostOpGas = (await ctx.paymaster.read.MIN_POSTOP_GAS()) as bigint;
     console.log(
       `\n    [postOp] cold-path gas vs MIN_POSTOP_GAS (${minPostOpGas}):\n` +
-        `      unprovisioned (!sponsored, latch branch not taken): ${unprovisioned}\n` +
+        `      unprovisioned (!sponsored, latch branch not taken): ${unprovisioned}  <- probe-only, UNREACHABLE in production (validation hard-declines !sponsored before _postOp can ever run — see comment below)\n` +
         `      sponsored, under cap (latch branch not taken):      ${sponsoredNotLatched}\n` +
         `      sponsored, over cap (LATCH FIRES: SSTORE + LOG2):   ${latched}\n` +
-        `      VIP, over cap (LATCH FIRES — VIP is not exempt):    ${vipLatched}\n` +
-        `      headroom under the worst case: ${minPostOpGas - unprovisioned} gas\n`,
+        `      VIP, over cap (LATCH FIRES — VIP is not exempt):    ${vipLatched}  <- REACHABLE worst case\n` +
+        `      headroom under the probe-only ceiling (NOT the real margin): ${minPostOpGas - unprovisioned} gas\n` +
+        `      headroom under the reachable worst case (the real margin):   ${minPostOpGas - vipLatched} gas\n`,
     );
 
     for (const [label, measured] of [
@@ -125,7 +147,8 @@ describe("VerifyingPaymaster._postOp — empirical cold-path gas", function () {
     assert.ok(
       unprovisioned > latched && unprovisioned > sponsoredNotLatched && unprovisioned > vipLatched,
       "the unprovisioned (fully cold, no prior SSTOREs to the policy slot) case must remain the " +
-        "worst case MIN_POSTOP_GAS is sized against",
+        "worst MEASURED case MIN_POSTOP_GAS is conservatively sized against (probe-only, NOT the " +
+        "reachable worst case in production — see the comment above)",
     );
   });
 });

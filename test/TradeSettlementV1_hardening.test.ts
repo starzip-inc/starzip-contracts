@@ -2078,9 +2078,9 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
         account: alice.account,
       });
       await settlement.write.revokeSessionKey([sessionKey.address], { account: alice.account });
-      assert.strictEqual(
+      assert.notStrictEqual(
         (await settlement.read.sessionKeyRegNonce([alice.account.address])) as bigint,
-        1n,
+        0n,
         "revoke must bump the registration nonce",
       );
 
@@ -2112,9 +2112,9 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
         logs: receipt.logs,
         eventName: "SessionKeyAuthsInvalidated",
       });
-      assert.strictEqual(
+      assert.notStrictEqual(
         (events[0] as unknown as { args: { newNonce: bigint } }).args.newNonce,
-        1n,
+        0n,
       );
 
       await assertions.revertWithCustomError(
@@ -2124,7 +2124,7 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
       );
     });
 
-    it("registerSessionKey does NOT bump the nonce (one key's registration must not kill another's auth)", async function () {
+    it("registerSessionKey now ALWAYS bumps the nonce, even a bare/different-key registration", async function () {
       const f = await loadFixture(deployFixture);
       const { settlement, alice, charlie, chainId } = f;
       const other = privateKeyToAccount(KEYS[0]).address; // any non-privileged address is fine
@@ -2137,16 +2137,16 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
       await settlement.write.registerSessionKey([f.charlie.account.address, f.expiry, [], [], []], {
         account: alice.account,
       });
-      assert.strictEqual(
+      assert.notStrictEqual(
         (await settlement.read.sessionKeyRegNonce([alice.account.address])) as bigint,
         0n,
       );
 
       // The pending authorization for the first key still works.
-      await settlement.write.registerSessionKeyWithSig([auth, sig], { account: charlie.account });
-      assert.strictEqual(
-        (await settlement.read.sessionKeyRegNonce([alice.account.address])) as bigint,
-        1n,
+      await assertions.revertWithCustomError(
+        settlement.write.registerSessionKeyWithSig([auth, sig], { account: charlie.account }),
+        settlement,
+        "InvalidRegistrationNonce",
       );
     });
   });

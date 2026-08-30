@@ -78,6 +78,8 @@ contract TradeSettlementV1 is
     uint256 public constant MAX_BATCH_SIZE = 50;
     uint256 public constant MAX_WITHDRAWAL_DELAY = 7 days;
 
+    uint256 public constant ITEM_GAS_BUDGET = 500_000;
+
     // Length of one withdrawal-rate-limit accounting window. A CONSTANT, never an owner
     // parameter: throughput is limit/window, so a settable window is a second, unsealed knob for
     // strangling withdrawals (lengthening it to 365 days would divide every configured limit's
@@ -441,6 +443,10 @@ contract TradeSettlementV1 is
     // per fill instead would need a slot per order hash to remember the running total.
     mapping(address => mapping(address => mapping(address => uint256))) public sessionKeyOrderCap;
 
+    mapping(address => mapping(address => uint256)) public sessionKeyGeneration;
+
+    mapping(address => mapping(address => mapping(address => uint256))) private sessionKeyCapGeneration;
+
     // ============ Storage Gap ============
     // Append-only rules, binding once this contract is deployed at its (fresh, clean-redeploy)
     // proxy address:
@@ -461,7 +467,7 @@ contract TradeSettlementV1 is
     // (49 -> 47). The session-key window change appended `sessionKeyOrderCap` (25) for one more
     // (47 -> 46); re-typing slot 18 from uint256 to SpendWindow cost no slot, since both fields
     // pack into the one it already had. Total footprint is therefore unchanged at slots 0–71.
-    uint256[46] private __gap;
+    uint256[44] private __gap;
 
     // ============ Structs ============
     // Signed Order (primary settlement path). `isBuy` distinguishes the buy side (pays quote,
@@ -640,6 +646,7 @@ contract TradeSettlementV1 is
     ///      rejected rather than ignored, so a replayed or stale invalidation transaction can never
     ///      LOWER the floor and resurrect orders the account already killed.
     error MinOrderNonceNotIncreasing();
+    error ReservedOrderNonce(address account, uint256 nonce);
     error PriceNotCrossed();
     error OrderOverfill();
     error SessionKeyNotAuthorized();
@@ -658,12 +665,14 @@ contract TradeSettlementV1 is
     error SessionKeyOrderCapExceeded(address token, uint256 maxDebit, uint256 orderCap);
     /// @dev SessionKeyAuth.tokens and .caps have different lengths.
     error ArrayLengthMismatch();
+    error DuplicateSessionKeyToken(address token);
     /// @dev `settleOrdersSelf` reached by anything other than this contract's own batch loop.
     error OnlySelf();
     /// @dev The item at `index` reverted with no return data, i.e. it ran out of gas. The batch is
     ///      aborted rather than continuing, so that a gas estimate can never settle on an amount
     ///      that quietly swallows every item. Send more gas or send a smaller batch.
     error BatchOutOfGas(uint256 index);
+    error ItemOutOfGas(uint256 index);
     /// @dev A per-window session-key cap above type(uint192).max, which `SpendWindow.used` cannot
     ///      hold. See `_writeSessionKeyCaps`.
     error InvalidSessionKeyCap();
@@ -1024,17 +1033,28 @@ contract TradeSettlementV1 is
 
         for (uint256 i = 0; i < n; ) {
             // solhint-disable-next-line no-empty-blocks
-            try this.settleOrdersSelf(items[i]) {
+            try this.settleOrdersSelf{gas: ITEM_GAS_BUDGET}(items[i]) {
                 // Success is already reported by _settleOne's OrdersSettled event.
             } catch (bytes memory reason) {
                 // Empty return data means the item was starved, not rejected — see the note above.
                 // Skipping it here is what would let a whole batch evaporate under a gas estimate
                 // that only ever measured the swallowing.
-                if (reason.length == 0) revert BatchOutOfGas(i);
                 // The raw revert data is forwarded so the operator can decode the same custom error
                 // it would have seen from a single-item settle — collapsing every failure into a
                 // flag would make a batch strictly harder to debug than the calls it replaces.
-                emit SettlementFailed(items[i].settlementId, i, reason);
+                if (reason.length == 0) {
+                    if (gasleft() >= ITEM_GAS_BUDGET / 63) {
+                        emit SettlementFailed(
+                            items[i].settlementId,
+                            i,
+                            abi.encodeWithSelector(ItemOutOfGas.selector, i)
+                        );
+                    } else {
+                        revert BatchOutOfGas(i);
+                    }
+                } else {
+                    emit SettlementFailed(items[i].settlementId, i, reason);
+                }
             }
             unchecked {
                 ++i;
@@ -1107,6 +1127,9 @@ contract TradeSettlementV1 is
         if (block.timestamp > sellOrder.expiry) revert OrderExpired();
         if (orderCancelled[buyHash]) revert OrderIsCancelled();
         if (orderCancelled[sellHash]) revert OrderIsCancelled();
+        if (buyOrder.nonce == type(uint256).max) revert ReservedOrderNonce(buyOrder.account, buyOrder.nonce);
+        if (sellOrder.nonce == type(uint256).max) revert ReservedOrderNonce(sellOrder.account, sellOrder.nonce);
+
         // Bulk invalidation floor. Checked here, next to the per-hash cancellation flags,
         // because it is the same class of check (the account withdrew its authorization) and must
         // bind BEFORE any balance moves. A floor raised after an order was signed retroactively
@@ -1284,6 +1307,7 @@ contract TradeSettlementV1 is
         if (sessionKey == address(0)) revert ZeroAddress();
         if (validUntil <= block.timestamp) revert SessionKeyNotAuthorized();
         if (tokens.length != caps.length || tokens.length != orderCaps.length) revert ArrayLengthMismatch();
+        _assertNoDuplicateTokens(tokens);
         _assertKeyAllowed(sessionKey);
         sessionKeyValidUntil[msg.sender][sessionKey] = validUntil;
 
@@ -1295,6 +1319,9 @@ contract TradeSettlementV1 is
         }
 
         emit SessionKeyRegistered(msg.sender, sessionKey, validUntil);
+
+        uint256 newNonce = _bumpSessionKeyRegNonce(msg.sender);
+        emit SessionKeyAuthsInvalidated(msg.sender, newNonce);
     }
 
     /**
@@ -1316,6 +1343,8 @@ contract TradeSettlementV1 is
     function setSessionKeyCap(address sessionKey, address token, uint256 cap, uint256 orderCap) external {
         if (sessionKey == address(0)) revert ZeroAddress();
         _writeSessionKeyCaps(msg.sender, sessionKey, token, cap, orderCap);
+        uint256 newNonce = _bumpSessionKeyRegNonce(msg.sender);
+        emit SessionKeyAuthsInvalidated(msg.sender, newNonce);
     }
 
     /**
@@ -1339,7 +1368,23 @@ contract TradeSettlementV1 is
         if (cap > type(uint192).max) revert InvalidSessionKeyCap();
         sessionKeySpendCap[account][sessionKey][token] = cap;
         sessionKeyOrderCap[account][sessionKey][token] = orderCap;
+        sessionKeyCapGeneration[account][sessionKey][token] = sessionKeyGeneration[account][sessionKey];
         emit SessionKeyCapUpdated(account, sessionKey, token, cap, orderCap);
+    }
+
+    function _assertNoDuplicateTokens(address[] calldata tokens) internal pure {
+        uint256 n = tokens.length;
+        for (uint256 i = 0; i < n; ) {
+            for (uint256 j = i + 1; j < n; ) {
+                if (tokens[i] == tokens[j]) revert DuplicateSessionKeyToken(tokens[i]);
+                unchecked {
+                    ++j;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     /**
@@ -1358,9 +1403,10 @@ contract TradeSettlementV1 is
         if (a.validUntil <= block.timestamp) revert SessionKeyNotAuthorized();
         if (block.timestamp > a.deadline) revert SignatureExpired();
         if (a.tokens.length != a.caps.length || a.tokens.length != a.orderCaps.length) revert ArrayLengthMismatch();
-        _assertKeyAllowed(a.sessionKey);
         if (a.nonce != sessionKeyRegNonce[a.account]) revert InvalidRegistrationNonce();
         if (!SignatureChecker.isValidSignatureNow(a.account, _hashSessionKeyAuth(a), sig)) revert InvalidSignature();
+        _assertNoDuplicateTokens(a.tokens);
+        _assertKeyAllowed(a.sessionKey);
 
         sessionKeyRegNonce[a.account]++;
         sessionKeyValidUntil[a.account][a.sessionKey] = a.validUntil;
@@ -1389,7 +1435,8 @@ contract TradeSettlementV1 is
      */
     function revokeSessionKey(address sessionKey) external {
         sessionKeyValidUntil[msg.sender][sessionKey] = 0;
-        uint256 newNonce = ++sessionKeyRegNonce[msg.sender];
+        ++sessionKeyGeneration[msg.sender][sessionKey];
+        uint256 newNonce = _bumpSessionKeyRegNonce(msg.sender);
         emit SessionKeyRevoked(msg.sender, sessionKey);
         emit SessionKeyAuthsInvalidated(msg.sender, newNonce);
     }
@@ -1400,8 +1447,37 @@ contract TradeSettlementV1 is
      *      touch already-registered keys (use revokeSessionKey for those).
      */
     function invalidateSessionKeyAuths() external {
-        uint256 newNonce = ++sessionKeyRegNonce[msg.sender];
+        uint256 newNonce = _bumpSessionKeyRegNonce(msg.sender);
         emit SessionKeyAuthsInvalidated(msg.sender, newNonce);
+    }
+
+    function _bumpSessionKeyRegNonce(address account) internal returns (uint256 newNonce) {
+        newNonce = uint256(
+            keccak256(abi.encodePacked(account, block.timestamp, block.prevrandao, sessionKeyRegNonce[account]))
+        );
+        sessionKeyRegNonce[account] = newNonce;
+    }
+
+    function effectiveSessionKeySpendCap(address account, address sessionKey, address token)
+        public
+        view
+        returns (uint256)
+    {
+        if (sessionKeyCapGeneration[account][sessionKey][token] != sessionKeyGeneration[account][sessionKey]) {
+            return 0;
+        }
+        return sessionKeySpendCap[account][sessionKey][token];
+    }
+
+    function effectiveSessionKeyOrderCap(address account, address sessionKey, address token)
+        public
+        view
+        returns (uint256)
+    {
+        if (sessionKeyCapGeneration[account][sessionKey][token] != sessionKeyGeneration[account][sessionKey]) {
+            return 0;
+        }
+        return sessionKeyOrderCap[account][sessionKey][token];
     }
 
     // ============ Internal Functions ============
@@ -1419,8 +1495,6 @@ contract TradeSettlementV1 is
         bytes32 orderHash = _hashOrder(order);
 
         // Path A: EOA (ecrecover) OR ERC-1271 contract wallet.
-        if (SignatureChecker.isValidSignatureNow(order.account, orderHash, sig)) return address(0);
-
         // Path B: registered session key. tryRecover rejects high-s malleability + bad length.
         (address rec, ECDSA.RecoverError err, ) = ECDSA.tryRecover(orderHash, sig);
         if (err == ECDSA.RecoverError.NoError && rec != address(0)) {
@@ -1437,6 +1511,8 @@ contract TradeSettlementV1 is
                 return rec;
             }
         }
+
+        if (SignatureChecker.isValidSignatureNow(order.account, orderHash, sig)) return address(0);
 
         revert InvalidSignature();
     }
@@ -1469,7 +1545,7 @@ contract TradeSettlementV1 is
     function _chargeSessionKey(address account, address sessionKey, address token, uint256 amount) internal {
         if (sessionKey == address(0)) return;
 
-        uint256 cap = sessionKeySpendCap[account][sessionKey][token];
+        uint256 cap = effectiveSessionKeySpendCap(account, sessionKey, token);
         SpendWindow memory w = sessionKeySpendWindows[account][sessionKey][token];
         uint64 currentWindow = uint64(block.timestamp / SESSION_KEY_WINDOW);
         // A stale window id means the budget already refilled; deriving it from the clock is what
@@ -1517,7 +1593,7 @@ contract TradeSettlementV1 is
             maxDebit = order.baseAmount;
         }
 
-        uint256 orderCap = sessionKeyOrderCap[order.account][sessionKey][token];
+        uint256 orderCap = effectiveSessionKeyOrderCap(order.account, sessionKey, token);
         if (maxDebit > orderCap) revert SessionKeyOrderCapExceeded(token, maxDebit, orderCap);
     }
 

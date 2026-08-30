@@ -14,8 +14,14 @@
  *      everywhere else (the paymaster validation runs out of gas -> EntryPoint AA33/AA36);
  *   2. it IS sponsorable at BATCH32_PM_VERIFICATION_GAS below, which is the figure the frontend /
  *      bundler must supply for max-size batches;
- *   3. the 32-call batch over ONE repeated target still fits comfortably in 100k (warm SLOADs) —
- *      i.e. the requirement is driven by DISTINCT targets, not by batch length alone.
+ *   3. the 32-call batch over ONE repeated target (warm SLOADs) is still a small fraction of the
+ *      distinct-target requirement — i.e. the requirement is driven by DISTINCT targets, not by
+ *      batch length alone. UPDATE (SSA-02 per-op sponsor-signature verification): the FIXED
+ *      per-op signing overhead this fix added applies once per `validatePaymasterUserOp` call
+ *      regardless of batch content, and is now by itself large enough that even this same-target
+ *      case no longer fits under the shared 100k baseline every other paymaster test uses — see
+ *      SAME_TARGET_BATCH32_PM_VERIFICATION_GAS below. The DISTINCT-vs-SAME-target gap this file
+ *      exists to measure is unchanged.
  *
  * The paymaster contract is NOT modified: this is a client-side gas-budgeting requirement.
  *
@@ -36,8 +42,10 @@ import {
   toFunctionSelector,
   encodeFunctionData,
   encodeAbiParameters,
+  getAddress,
   pad,
   toHex,
+  zeroAddress,
   type Address,
   type Hex,
   type Abi,
@@ -51,6 +59,7 @@ import {
   execWithPaymaster,
   computeMaxCost,
   encodePasskeyOwner,
+  SPONSOR_SIGNER,
 } from "./aa-helpers.js";
 
 const PASSKEY_PRIV = hexToBytes(
@@ -74,11 +83,27 @@ const LEGACY_PM_VERIFICATION_GAS = 100_000n;
 /**
  * Required `paymasterVerificationGasLimit` for a MAX_BATCH_SIZE batch over DISTINCT targets.
  * MEASURED by the "derives the threshold" test below over the real EntryPoint v0.8 handleOps
- * path: 215_000 fails, 220_000 is the first rung that sponsors. Set at 250_000 for a ~14% margin.
- * Clients building batches MUST use at least this value; the fixed 100_000 every other paymaster
- * test uses is only safe for small / same-target batches.
+ * path. RE-MEASURED for SSA-02 (per-op sponsor-signature verification: 2 keccak256 + a 12-field
+ * abi.encode + ecrecover + a cold SLOAD for the sponsor signer, added to every
+ * `validatePaymasterUserOp` call): 230_000 fails, 235_000 is the first rung that sponsors — up
+ * from the pre-SSA-02 (215_000 fails, 220_000 passes). Set at 270_000 for a ~15% margin (was
+ * 250_000 / ~14%). Clients building batches MUST use at least this value; the fixed 100_000
+ * every other paymaster test uses is no longer safe even for same-target batches — see
+ * `SAME_TARGET_BATCH32_PM_VERIFICATION_GAS` below.
  */
-const BATCH32_PM_VERIFICATION_GAS = 250_000n;
+const BATCH32_PM_VERIFICATION_GAS = 270_000n;
+/**
+ * Required `paymasterVerificationGasLimit` for a 32-call batch over a SINGLE (repeated, warm)
+ * target — added for SSA-02. Before SSA-02, this fit comfortably under the shared
+ * `LEGACY_PM_VERIFICATION_GAS` (100_000) baseline; the FIXED per-op signature-verification
+ * overhead SSA-02 added (see `BATCH32_PM_VERIFICATION_GAS`'s comment) applies once per
+ * `validatePaymasterUserOp` call regardless of batch size or target distinctness, and is now by
+ * itself large enough to push even this warm/same-target case past 100_000. Bisected floor:
+ * 109_000 fails, 110_000 is the first rung that sponsors. Set at 115_000 for headroom — still a
+ * small fraction of `BATCH32_PM_VERIFICATION_GAS`, so the DISTINCT-target cost driver this file
+ * exists to isolate is unchanged; only the flat floor moved.
+ */
+const SAME_TARGET_BATCH32_PM_VERIFICATION_GAS = 115_000n;
 
 // n distinct, code-less addresses starting at `base`. A `call` into an account with no code
 // always succeeds, so the inner business calls are free no-ops and the measurement isolates the
@@ -96,24 +121,34 @@ describe("VerifyingPaymaster batch verification gas", function () {
     const publicClient = await viem.getPublicClient();
 
     const entryPoint = await viem.deployContract("TestEntryPoint", []);
-    const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
-    const { x, y } = passkeyPubCoords(PASSKEY_PRIV);
-    const firstOwner = encodePasskeyOwner(x, y);
-    await factory.write.createAccount([[firstOwner], SALT], { account: deployer.account });
-    const walletAddr = (await factory.read.getAddress([[firstOwner], SALT])) as Address;
-    const wallet = await viem.getContractAt("StarzipWallet", walletAddr);
 
     const paymaster = await viem.deployContract("VerifyingPaymaster", [
       entryPoint.address,
       policyManagerWallet.account.address,
+      zeroAddress,
+      SPONSOR_SIGNER,
     ]);
     await paymaster.write.transferOwnership([ownerWallet.account.address], {
       account: deployer.account,
     });
     await paymaster.write.acceptOwnership({ account: ownerWallet.account });
 
+    const factory = await viem.deployContract("StarzipWalletFactory", [
+      entryPoint.address,
+      paymaster.address,
+    ]);
+    const { x, y } = passkeyPubCoords(PASSKEY_PRIV);
+    const firstOwner = encodePasskeyOwner(x, y);
+    await factory.write.createAccount([[firstOwner], SALT], { account: deployer.account });
+    const walletAddr = (await factory.read.getAddress([[firstOwner], SALT])) as Address;
+    const wallet = await viem.getContractAt("StarzipWallet", walletAddr);
+
     const asOwner = { account: ownerWallet.account };
     const asPm = { account: policyManagerWallet.account };
+
+    if ((await wallet.read.trustedPaymaster()) !== getAddress(paymaster.address)) {
+      throw new Error(`fixture: wallet ${walletAddr} not born trusting the deployed paymaster`);
+    }
 
     // unpause() now refuses while any of the three per-op caps is unprovisioned (0).
     // Set generously so none of them is the thing this file's gas measurements are isolating —
@@ -248,18 +283,29 @@ describe("VerifyingPaymaster batch verification gas", function () {
     assert.ok(sponsored(f, receipt), "GasSponsored must be emitted");
   });
 
-  it("32 calls to ONE target still fit in 100k — the cost driver is DISTINCT targets", async function () {
+  it("32 calls to ONE target still fits in a small fraction of the DISTINCT-target requirement — the cost driver is DISTINCT targets, not batch length (SSA-02 moved the flat floor past 100k for every batch, see SAME_TARGET_BATCH32_PM_VERIFICATION_GAS)", async function () {
+    // Pre-SSA-02 this fit inside LEGACY_PM_VERIFICATION_GAS (100_000) — see
+    // SAME_TARGET_BATCH32_PM_VERIFICATION_GAS's comment for the bisected floor (109_000 fails,
+    // 110_000 passes) and why the fixed per-op signing overhead pushed it past 100_000 for every
+    // batch, not just distinct-target ones. The finding this test exists to pin — SAME target
+    // stays dramatically cheaper than DISTINCT targets — is unchanged.
     const f = await loadFixture(fixture);
     const same = Array.from({ length: BATCH_N }, () => f.targets[0]);
-    const receipt = await submitBatch(f, same, LEGACY_PM_VERIFICATION_GAS);
+    const receipt = await submitBatch(f, same, SAME_TARGET_BATCH32_PM_VERIFICATION_GAS);
     assert.strictEqual(receipt.status, "success");
     assert.ok(sponsored(f, receipt), "GasSponsored must be emitted");
+    assert.ok(
+      SAME_TARGET_BATCH32_PM_VERIFICATION_GAS < BATCH32_PM_VERIFICATION_GAS,
+      "the SAME-target floor must stay strictly below the DISTINCT-target requirement — that gap IS the finding",
+    );
   });
 
   it("derives the threshold: the minimum viable limit sits between 100k and BATCH32_PM_VERIFICATION_GAS", async function () {
     // Coarse ladder rather than a binary search, so the evidence reads as a table.
-    // Measured on this tree: 200k/205k/210k/215k all fail, 220k is the first rung that sponsors.
-    const ladder = [100_000n, 150_000n, 200_000n, 215_000n, 220_000n, 250_000n];
+    // RE-MEASURED for SSA-02 (per-op signature verification, see BATCH32_PM_VERIFICATION_GAS's
+    // comment): 215k/220k/225k/230k all fail, 235k is the first rung that sponsors — up from the
+    // pre-SSA-02 200k/205k/210k/215k fail, 220k passes.
+    const ladder = [100_000n, 150_000n, 200_000n, 230_000n, 235_000n, 270_000n];
     const outcomes: Array<[bigint, boolean]> = [];
     for (const limit of ladder) {
       const g = await loadFixture(fixture);
@@ -282,8 +328,8 @@ describe("VerifyingPaymaster batch verification gas", function () {
     // Band assertion, not an exact equality: a solc/EntryPoint bump may move the rung a little,
     // but it must not silently drift past the constant clients are told to use.
     assert.ok(
-      firstOk[0] > 215_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
-      `threshold ${firstOk[0]} left the documented (215k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
+      firstOk[0] > 230_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
+      `threshold ${firstOk[0]} left the documented (230k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
     );
     // Monotonic: once a limit works, every larger limit must work too.
     for (let i = outcomes.indexOf(firstOk); i < outcomes.length; i++) {
@@ -298,21 +344,26 @@ describe("VerifyingPaymaster batch verification gas", function () {
   // file uses, so it does not itself constrain the finding, which is about
   // `paymasterVerificationGasLimit`):
   //   ALL-SELF (32x addOwnerAddress, 32 distinct owner arguments — a REPEATED argument reverts
-  //     `AlreadyOwner` on the second occurrence): 88_000 fails, 90_000 is the first rung that
-  //     sponsors. That is INSIDE `LEGACY_PM_VERIFICATION_GAS` (100_000) — the limit every OTHER
-  //     paymaster test in this repo already uses — so an all-self admin batch needs NO
-  //     client-side gas bump at all, unlike the 32-distinct-BUSINESS-target case above.
-  //   MIXED (16x self `addOwnerAddress` + 16x business `SEL`): 155_000 fails, 160_000 is the
-  //     first rung that sponsors — between the two pure cases, as expected, and still well
-  //     under `BATCH32_PM_VERIFICATION_GAS` (250_000).
+  //     `AlreadyOwner` on the second occurrence): pre-SSA-02, 88_000 failed and 90_000 was the
+  //     first rung that sponsored — INSIDE `LEGACY_PM_VERIFICATION_GAS` (100_000), so an all-self
+  //     admin batch needed no client-side gas bump at all.
+  //   MIXED (16x self `addOwnerAddress` + 16x business `SEL`): pre-SSA-02, 155_000 failed and
+  //     160_000 was the first rung that sponsored — between the two pure cases, as expected.
+  //   RE-MEASURED for SSA-02 (per-op signature verification, see
+  //   `BATCH32_PM_VERIFICATION_GAS`'s comment — the FIXED per-op overhead applies here too, on
+  //   top of the self/mixed-path SLOAD savings below, which are unchanged):
+  //     ALL-SELF: 100_000 fails, 100_500 is the first rung that sponsors — the fixed overhead
+  //       alone (~10.5k) is now enough to push this PAST the shared `LEGACY_PM_VERIFICATION_GAS`
+  //       baseline too, so an all-self admin batch now DOES need a small client-side bump.
+  //     MIXED: 168_000 fails, 169_000 is the first rung that sponsors.
   // Both confirm §0 of the plan: the self path is `selfSelectorAllowlist[sel]` (1 keccak, 1
   // SLOAD) versus the business path's `businessAllowlist[target]` +
   // `targetSelectorAllowlist[target][sel]` (3 keccaks, 2 SLOADs) — strictly cheaper per element.
   // `BATCH32_PM_VERIFICATION_GAS` does NOT need to move for item 4: these figures are LOWER than
   // the all-business case, never higher.
   const CALL_GAS_SELF = 2_500_000n; // sized for 32 real addOwnerAddress state writes
-  const SELF_BATCH32_PM_VERIFICATION_GAS = 100_000n; // == LEGACY_PM_VERIFICATION_GAS; measured floor 90_000
-  const MIXED_BATCH32_PM_VERIFICATION_GAS = 160_000n; // measured floor 160_000 (155_000 fails)
+  const SELF_BATCH32_PM_VERIFICATION_GAS = 115_000n; // measured floor (100_000 fails, 100_500 passes); was 100_000 (== LEGACY), pre-SSA-02 floor 90_000
+  const MIXED_BATCH32_PM_VERIFICATION_GAS = 170_000n; // measured floor (168_000 fails, 169_000 passes); was 160_000 (155_000 fails, pre-SSA-02)
 
   function selfCallData(walletAbi: Abi, newOwner: Address): Hex {
     return encodeFunctionData({
@@ -372,15 +423,18 @@ describe("VerifyingPaymaster batch verification gas", function () {
     }
   });
 
-  it("derives the ALL-SELF threshold: sits at (85k, 100k], strictly below the business-path threshold", async function () {
+  it("derives the ALL-SELF threshold: sits at (100k, 115k], strictly below the business-path threshold (SSA-02 moved this band up from the pre-fix (85k, 100k])", async function () {
     const newOwners = distinctAddrs(BATCH_N, 0x9000);
+    // RE-MEASURED for SSA-02 (per-op signature verification, see BATCH32_PM_VERIFICATION_GAS's
+    // comment): 100_000 fails, 100_500 is the first rung that sponsors — pre-SSA-02 this was
+    // 88_000 fails, 90_000 passes.
     const ladder = [
-      70_000n,
-      80_000n,
       85_000n,
-      88_000n,
       90_000n,
-      92_000n,
+      95_000n,
+      100_000n,
+      100_500n,
+      101_000n,
       SELF_BATCH32_PM_VERIFICATION_GAS,
     ];
     const outcomes: Array<[bigint, boolean]> = [];
@@ -401,8 +455,8 @@ describe("VerifyingPaymaster batch verification gas", function () {
     const firstOk = outcomes.find(([, ok]) => ok);
     assert.ok(firstOk, `no ladder rung sponsored the all-self batch: ${rendered}`);
     assert.ok(
-      firstOk[0] > 85_000n && firstOk[0] <= LEGACY_PM_VERIFICATION_GAS,
-      `self-path threshold ${firstOk[0]} left the measured (85k, 100k] band (${rendered})`,
+      firstOk[0] > 100_000n && firstOk[0] <= SELF_BATCH32_PM_VERIFICATION_GAS,
+      `self-path threshold ${firstOk[0]} left the measured (100k, ${SELF_BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
     );
     for (let i = outcomes.indexOf(firstOk); i < outcomes.length; i++) {
       assert.ok(outcomes[i][1], `limit ${outcomes[i][0]} regressed after ${firstOk[0]} passed`);
@@ -411,13 +465,18 @@ describe("VerifyingPaymaster batch verification gas", function () {
 
   it("derives the MIXED threshold: sits between the pure self and pure business thresholds", async function () {
     const newOwners = distinctAddrs(16, 0x9000);
+    // RE-MEASURED for SSA-02 (per-op signature verification, see BATCH32_PM_VERIFICATION_GAS's
+    // comment): 168_000 fails, 169_000 is the first rung that sponsors — pre-SSA-02 this was
+    // 155_000 fails, 160_000 passes.
     const ladder = [
       130_000n,
       145_000n,
       150_000n,
       155_000n,
+      165_000n,
+      168_000n,
+      169_000n,
       MIXED_BATCH32_PM_VERIFICATION_GAS,
-      170_000n,
     ];
     const outcomes: Array<[bigint, boolean]> = [];
     for (const limit of ladder) {
@@ -440,8 +499,8 @@ describe("VerifyingPaymaster batch verification gas", function () {
     const firstOk = outcomes.find(([, ok]) => ok);
     assert.ok(firstOk, `no ladder rung sponsored the mixed batch: ${rendered}`);
     assert.ok(
-      firstOk[0] > 150_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
-      `mixed threshold ${firstOk[0]} left the measured (150k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
+      firstOk[0] > 165_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
+      `mixed threshold ${firstOk[0]} left the measured (165k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
     );
     for (let i = outcomes.indexOf(firstOk); i < outcomes.length; i++) {
       assert.ok(outcomes[i][1], `limit ${outcomes[i][0]} regressed after ${firstOk[0]} passed`);

@@ -156,7 +156,7 @@ describe("StarzipWallet — ERC-1271 / ERC-7739", function () {
     const chainId = await publicClient.getChainId();
 
     const entryPoint = await viem.deployContract("TestEntryPoint", []);
-    const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+    const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
     const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
     await factory.write.createAccount([[firstOwner], SALT], {
       account: deployer.account,

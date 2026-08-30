@@ -24,9 +24,9 @@ contract StarzipWalletFactory {
     ///      NatSpec for why a wallet must not be born with only one owner.
     event AccountCreated(address indexed account, bytes[] owners, uint256 salt);
 
-    constructor(IEntryPoint _entryPoint) {
+    constructor(IEntryPoint _entryPoint, address _canonicalPaymaster) {
         entryPoint = _entryPoint;
-        accountImplementation = new StarzipWallet(_entryPoint);
+        accountImplementation = new StarzipWallet(_entryPoint, _canonicalPaymaster);
     }
 
     // ============ Factory ============

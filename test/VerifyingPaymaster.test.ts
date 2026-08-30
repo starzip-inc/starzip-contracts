@@ -34,6 +34,7 @@ import {
   computeMaxCost,
   encodePasskeyOwner,
   encodeAddressOwner,
+  SPONSOR_SIGNER,
 } from "./aa-helpers.js";
 
 // Deterministic P-256 test keys (NOT for production). Scalars < n. Reused from StarzipWallet.test.ts.
@@ -101,7 +102,17 @@ async function deployFixture() {
   const publicClient = await viem.getPublicClient();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+
+  const paymaster = await viem.deployContract(
+    "VerifyingPaymaster",
+    [entryPoint.address, policyManagerWallet.account.address, zeroAddress, SPONSOR_SIGNER],
+    { client: { wallet: ownerWallet } },
+  );
+
+  const factory = await viem.deployContract("StarzipWalletFactory", [
+    entryPoint.address,
+    paymaster.address,
+  ]);
 
   const { x: PK_X_A, y: PK_Y_A } = passkeyPubCoords(PASSKEY_PRIV_A);
   const { x: PK_X_B, y: PK_Y_B } = passkeyPubCoords(PASSKEY_PRIV_B);
@@ -121,12 +132,6 @@ async function deployFixture() {
   const walletB = await viem.getContractAt("StarzipWallet", walletBAddr);
 
   // Deploy as `ownerWallet` so Ownable2Step's owner() != policyManager (distinct hot/cold roles).
-  const paymaster = await viem.deployContract(
-    "VerifyingPaymaster",
-    [entryPoint.address, policyManagerWallet.account.address],
-    { client: { wallet: ownerWallet } },
-  );
-
   // unpause() now refuses while any of the three per-op caps is unprovisioned (0).
   // Provisioned once here, generously, so every test in this file that calls `unpause()` (via
   // this fixture) inherits non-zero caps without having to know about them; tests that isolate
@@ -159,6 +164,7 @@ async function deployFixture() {
     const fundHash = await deployer.sendTransaction({ to: addr, value: parseEther("2") });
     await publicClient.waitForTransactionReceipt({ hash: fundHash });
   }
+
 
   return {
     viem,
@@ -257,7 +263,12 @@ describe("VerifyingPaymaster (policy-storage)", function () {
       assert.strictEqual(await ctx.paymaster.read.paused(), true);
 
       await assertions.revertWithCustomError(
-        ctx.viem.deployContract("VerifyingPaymaster", [ctx.entryPoint.address, zeroAddress]),
+        ctx.viem.deployContract("VerifyingPaymaster", [
+          ctx.entryPoint.address,
+          zeroAddress,
+          zeroAddress,
+          SPONSOR_SIGNER,
+        ]),
         null,
         "ZeroAddress",
       );

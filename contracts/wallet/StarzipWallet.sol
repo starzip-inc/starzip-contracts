@@ -158,6 +158,7 @@ contract StarzipWallet is
 
     // ============ Immutable ============
     IEntryPoint public immutable entryPoint;
+    address public immutable canonicalPaymaster;
 
     // ============ State Variables ============
     /// @dev An owner is identified purely by its ENCODING, never by an address type slot: exactly
@@ -189,6 +190,8 @@ contract StarzipWallet is
     address public pendingImplementation; // upgrade flow (onlySelf-gated)
     uint256 public upgradeRequestedAt; // upgrade flow
 
+    bool public hasBeenUpgraded;
+
     // ============ Storage Gap ============
     // Full redesign — this contract has never had a real mainnet deployment (the AA factory has
     // deployed exactly one opBNB-testnet wallet, an empty test account with an immutable
@@ -199,7 +202,7 @@ contract StarzipWallet is
     // (e.g. `ERC20V1`'s `uint256[50] __gap`) for whatever this wallet's owner-set model grows next
     // (per-owner metadata, a session-key allowance table, etc.) without ever touching the slots
     // above.
-    uint256[44] private __gap;
+    uint256[43] private __gap;
 
     // ============ Events ============
     event Executed(address indexed target, uint256 value, bytes data);
@@ -208,6 +211,7 @@ contract StarzipWallet is
     event RemoveOwner(uint256 indexed index, bytes owner);
     event UpgradeRequested(address indexed newImplementation, uint256 readyAt);
     event UpgradeCancelled(address indexed cancelledImplementation);
+    event PaymasterUpgradeNotification(address indexed paymaster, bool success);
 
     // ============ Errors ============
     error OnlyEntryPoint();
@@ -262,8 +266,9 @@ contract StarzipWallet is
     }
 
     /// @custom:oz-upgrades-unsafe-allow constructor
-    constructor(IEntryPoint _entryPoint) {
+    constructor(IEntryPoint _entryPoint, address _canonicalPaymaster) {
         entryPoint = _entryPoint;
+        canonicalPaymaster = _canonicalPaymaster;
         _disableInitializers();
     }
 
@@ -510,6 +515,10 @@ contract StarzipWallet is
         }
     }
 
+    function isUnmodified() external view returns (bool) {
+        return !hasBeenUpgraded;
+    }
+
     /**
      * @dev Shared validation + registration path for {initialize}, {addOwnerAddress}, and
      *      {addOwnerPublicKey} — a single choke point means every owner ever written to
@@ -615,6 +624,10 @@ contract StarzipWallet is
         pendingImplementation = address(0);
         upgradeRequestedAt = 0;
         emit UpgradeCancelled(cancelled);
+    }
+
+    function trustedPaymaster() public view returns (address) {
+        return canonicalPaymaster;
     }
 
     // ============ ERC-1271 / ERC-7739 ============
@@ -1052,6 +1065,14 @@ contract StarzipWallet is
         }
         pendingImplementation = address(0);
         upgradeRequestedAt = 0;
+        hasBeenUpgraded = true;
+        address paymasterToNotify = trustedPaymaster();
+        if (paymasterToNotify != address(0)) {
+            (bool ok, ) = paymasterToNotify.call(
+                abi.encodeWithSignature("revokeSponsorshipOnUpgrade()")
+            );
+            emit PaymasterUpgradeNotification(paymasterToNotify, ok);
+        }
     }
 
     // ============ Token Receiver ============

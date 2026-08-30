@@ -48,6 +48,7 @@ import {
   encodeFunctionData,
   toFunctionSelector,
   zeroAddress,
+  getAddress,
   type Address,
   type Hex,
 } from "viem";
@@ -60,6 +61,7 @@ import {
   execWithPaymaster,
   computeMaxCost,
   encodePasskeyOwner,
+  SPONSOR_SIGNER,
 } from "./aa-helpers.js";
 
 const PASSKEY_PRIV = hexToBytes(
@@ -91,7 +93,16 @@ async function deployFixture() {
   const publicClient = await viem.getPublicClient();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+
+  const paymaster = await viem.deployContract(
+    "VerifyingPaymaster",
+    [entryPoint.address, policyManagerWallet.account.address, zeroAddress, SPONSOR_SIGNER],
+    { client: { wallet: ownerWallet } },
+  );
+  const factory = await viem.deployContract("StarzipWalletFactory", [
+    entryPoint.address,
+    paymaster.address,
+  ]);
 
   const { x, y } = passkeyPubCoords(PASSKEY_PRIV);
   const firstOwner = encodePasskeyOwner(x, y);
@@ -99,11 +110,6 @@ async function deployFixture() {
   const walletAddr = (await factory.read.getAddress([[firstOwner], SALT])) as Address;
   const wallet = await viem.getContractAt("StarzipWallet", walletAddr);
 
-  const paymaster = await viem.deployContract(
-    "VerifyingPaymaster",
-    [entryPoint.address, policyManagerWallet.account.address],
-    { client: { wallet: ownerWallet } },
-  );
   const depositHash = await deployer.sendTransaction({
     to: paymaster.address,
     value: REAL_DEPOSIT,
@@ -124,6 +130,10 @@ async function deployFixture() {
     initData,
   ]);
   const settlement = await viem.getContractAt("TradeSettlementV1", settlementProxy.address);
+
+  if ((await wallet.read.trustedPaymaster()) !== getAddress(paymaster.address)) {
+    throw new Error(`fixture: wallet ${walletAddr} not born trusting the deployed paymaster`);
+  }
 
   return {
     viem,

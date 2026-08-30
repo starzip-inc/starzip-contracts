@@ -23,12 +23,14 @@ import { describe, it } from "node:test";
 import assert from "node:assert";
 import {
   getAddress,
+  getContractAddress,
   parseEther,
   parseEventLogs,
   hexToBytes,
   encodeFunctionData,
   concatHex,
   toFunctionSelector,
+  zeroAddress,
   type Address,
   type Hex,
 } from "viem";
@@ -44,6 +46,8 @@ import {
   webauthnSignature,
   encodePasskeyOwner,
   encodeSignatureWrapper,
+  SPONSOR_SIGNER,
+  signPaymasterData,
 } from "./aa-helpers.js";
 
 const PASSKEY_PRIV = hexToBytes(
@@ -84,7 +88,18 @@ async function deployFixtureWithDeposit(depositWei: bigint) {
   const publicClient = await viem.getPublicClient();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+
+  // Deploy as `ownerWallet` so Ownable2Step's owner() != policyManager (distinct hot/cold roles).
+  const paymaster = await viem.deployContract(
+    "VerifyingPaymaster",
+    [entryPoint.address, policyManagerWallet.account.address, zeroAddress, SPONSOR_SIGNER],
+    { client: { wallet: ownerWallet } },
+  );
+
+  const factory = await viem.deployContract("StarzipWalletFactory", [
+    entryPoint.address,
+    paymaster.address,
+  ]);
 
   const { x, y } = passkeyPubCoords(PASSKEY_PRIV);
   const firstOwner = encodePasskeyOwner(x, y);
@@ -92,19 +107,16 @@ async function deployFixtureWithDeposit(depositWei: bigint) {
   const walletAddr = (await factory.read.getAddress([[firstOwner], SALT])) as Address;
   const wallet = await viem.getContractAt("StarzipWallet", walletAddr);
 
-  // Deploy as `ownerWallet` so Ownable2Step's owner() != policyManager (distinct hot/cold roles).
-  const paymaster = await viem.deployContract(
-    "VerifyingPaymaster",
-    [entryPoint.address, policyManagerWallet.account.address],
-    { client: { wallet: ownerWallet } },
-  );
-
   const depositHash = await deployer.sendTransaction({
     to: paymaster.address,
     value: depositWei,
     data: "0xd0e30db0" as Hex, // deposit() selector
   });
   await publicClient.waitForTransactionReceipt({ hash: depositHash });
+
+  if ((await wallet.read.trustedPaymaster()) !== getAddress(paymaster.address)) {
+    throw new Error(`fixture: wallet ${walletAddr} not born trusting the deployed paymaster`);
+  }
 
   return {
     viem,
@@ -142,18 +154,36 @@ async function deployFixtureUndeployedWallet() {
   const publicClient = await viem.getPublicClient();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+
+  const deployerNonce = await publicClient.getTransactionCount({ address: deployer.account.address });
+  const predictedFactory = getContractAddress({
+    from: deployer.account.address,
+    nonce: BigInt(deployerNonce),
+  });
+
+  const paymaster = await viem.deployContract(
+    "VerifyingPaymaster",
+    [entryPoint.address, policyManagerWallet.account.address, predictedFactory, SPONSOR_SIGNER],
+    { client: { wallet: ownerWallet } },
+  );
+
+  const factory = await viem.deployContract(
+    "StarzipWalletFactory",
+    [entryPoint.address, paymaster.address],
+    { client: { wallet: deployer } },
+  );
+  if (getAddress(factory.address) !== getAddress(predictedFactory)) {
+    throw new Error(
+      `fixture: StarzipWalletFactory landed at ${factory.address}, predicted ${predictedFactory} ` +
+        `— deployer nonce moved between the prediction and the deploy (see this fixture's own ` +
+        `comment on scripts/deploy-aa.ts's identical prediction recipe).`,
+    );
+  }
 
   const { x, y } = passkeyPubCoords(PASSKEY_PRIV);
   const firstOwner = encodePasskeyOwner(x, y);
   const walletAddr = (await factory.read.getAddress([[firstOwner], SALT])) as Address;
   const wallet = await viem.getContractAt("StarzipWallet", walletAddr);
-
-  const paymaster = await viem.deployContract(
-    "VerifyingPaymaster",
-    [entryPoint.address, policyManagerWallet.account.address],
-    { client: { wallet: ownerWallet } },
-  );
 
   const depositHash = await deployer.sendTransaction({
     to: paymaster.address,
@@ -208,8 +238,17 @@ async function setupHappyPath(
   await ownerWrite(ctx, "setMaxSponsoredOpCost", [parseEther("1")]);
   await ownerWrite(ctx, "setMaxSponsoredFeePerGas", [MAX_FEE_PER_GAS]);
   await ownerWrite(ctx, "setMaxSponsoredPreVerificationGas", [1_000_000n]);
-  await pmWrite(ctx, "setSponsored", [ctx.walletAddr, true]);
-  await ownerWrite(ctx, "setSponsorPersonal", [ctx.walletAddr, true]);
+  const preCode = await ctx.publicClient.getCode({ address: ctx.walletAddr });
+  const codeless = preCode === undefined || preCode === "0x";
+  if (codeless) {
+    const { pubKeyX, pubKeyY } = ctx as unknown as { pubKeyX: Hex; pubKeyY: Hex };
+    const counterfactualArgs = [[encodePasskeyOwner(pubKeyX, pubKeyY)], SALT] as const;
+    await pmWrite(ctx, "setSponsoredCounterfactual", [...counterfactualArgs, true]);
+    await ownerWrite(ctx, "setSponsorPersonalCounterfactual", [...counterfactualArgs, true]);
+  } else {
+    await pmWrite(ctx, "setSponsored", [ctx.walletAddr, true]);
+    await ownerWrite(ctx, "setSponsorPersonal", [ctx.walletAddr, true]);
+  }
   await pmWrite(ctx, "setDailyCap", [ctx.walletAddr, opts.dailyCap ?? parseEther("1")]);
   await ownerWrite(ctx, "unpause");
 }
@@ -271,16 +310,21 @@ async function submitBundle(
   } = {},
 ) {
   const callData = buildExecuteCallData(ctx.wallet.abi, ctx.walletAddr, 0n);
-  const paymasterAndData = paymasterAndDataFor(ctx.paymaster.address, PM_VAL_GAS, PM_POST_GAS);
+  const unsignedPaymasterAndData = paymasterAndDataFor(ctx.paymaster.address, PM_VAL_GAS, PM_POST_GAS);
   const startNonce = (await ctx.entryPoint.read.getNonce([ctx.walletAddr, 0n])) as bigint;
+  const chainId = BigInt(await ctx.publicClient.getChainId());
 
   const userOps = [];
   for (let i = 0; i < n; i++) {
     const userOp = buildUserOp(ctx.walletAddr, startNonce + BigInt(i), callData);
-    userOp.paymasterAndData = paymasterAndData;
+    userOp.paymasterAndData = unsignedPaymasterAndData;
     userOp.accountGasLimits = overrides.accountGasLimits ?? ACCOUNT_GAS_LIMITS;
     userOp.preVerificationGas = overrides.preVerificationGas ?? PRE_VER_GAS;
     userOp.gasFees = overrides.gasFees ?? GAS_FEES;
+    // Sign the paymaster's own per-op authorization LAST — after every gas field is finalized,
+    // and BEFORE deriving the EntryPoint userOpHash (which hashes paymasterAndData, so the
+    // passkey signature below must sign over the FULLY signed 129-byte field).
+    userOp.paymasterAndData = await signPaymasterData({ userOp, chainId });
     const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
     userOp.signature = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
     userOps.push(userOp);
@@ -581,7 +625,7 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
     // of MAX_COST against a dailyCap of MAX_COST (NOT the ~5%/op the C-B block's TRIGGER_N=20
     // implies — that constant is a deliberately generous margin, not a tight bound, per its own
     // comment). 4 ops stays under; a 5th crosses.
-    const NEAR_CAP_BUNDLE_SIZE = 4;
+    const NEAR_CAP_BUNDLE_SIZE = 2;
 
     async function spendNearCap(ctx: Ctx): Promise<bigint> {
       await ownerWrite(ctx, "setGlobalDailyCapCeiling", [NEAR_CAP_DAILY_CAP]);
@@ -622,8 +666,8 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       assert.strictEqual(
         policy.sponsored,
         true,
-        "M5a: without the counter reset, the carried-forward near-cap spend (4 ops' worth, ~80% " +
-          "of the cap) plus this 5th op's cost crosses the cap, revoking sponsorship on the very " +
+        "M5a: without the counter reset, the carried-forward near-cap spend (2 ops' worth, ~76% " +
+          "of the cap) plus this 3rd op's cost crosses the cap, revoking sponsorship on the very " +
           "first VIP op",
       );
     });
@@ -897,6 +941,7 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       );
 
       const nonce = (await ctx.entryPoint.read.getNonce([ctx.walletAddr, 0n])) as bigint;
+      const chainId = BigInt(await ctx.publicClient.getChainId());
       const userOp = {
         sender: ctx.walletAddr,
         nonce,
@@ -908,6 +953,9 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
         paymasterAndData: paymasterAndDataFor(ctx.paymaster.address, PM_VAL_GAS, PM_POST_GAS),
         signature: "0x" as Hex,
       };
+      // Sign the paymaster's per-op authorization LAST (every gas field above is in the preimage)
+      // and BEFORE deriving the EntryPoint userOpHash, which hashes paymasterAndData.
+      userOp.paymasterAndData = await signPaymasterData({ userOp, chainId });
       const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
       userOp.signature = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
 
@@ -954,7 +1002,11 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       const businessSelector = toFunctionSelector("allowedBusinessCall()");
       await ownerWrite(ctx, "setBusinessTarget", [businessTarget, true]);
       await ownerWrite(ctx, "setTargetSelector", [businessTarget, businessSelector, true]);
-      await pmWrite(ctx, "setSponsored", [ctx.walletAddr, true]);
+      await pmWrite(ctx, "setSponsoredCounterfactual", [
+        [encodePasskeyOwner(ctx.pubKeyX, ctx.pubKeyY)],
+        SALT,
+        true,
+      ]);
       await pmWrite(ctx, "setDailyCap", [ctx.walletAddr, REAL_CEILING]);
       // Deliberately NOT calling setSponsorPersonal — sanity-checked below.
       await ownerWrite(ctx, "unpause");
@@ -994,6 +1046,7 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       );
 
       const nonce = (await ctx.entryPoint.read.getNonce([ctx.walletAddr, 0n])) as bigint;
+      const chainId = BigInt(await ctx.publicClient.getChainId());
       const userOp = {
         sender: ctx.walletAddr,
         nonce,
@@ -1005,6 +1058,9 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
         paymasterAndData: paymasterAndDataFor(ctx.paymaster.address, PM_VAL_GAS, PM_POST_GAS),
         signature: "0x" as Hex,
       };
+      // Sign the paymaster's per-op authorization LAST and BEFORE deriving the EntryPoint
+      // userOpHash, which hashes paymasterAndData.
+      userOp.paymasterAndData = await signPaymasterData({ userOp, chainId });
       const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
       userOp.signature = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
 
@@ -1239,6 +1295,8 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       // restore reachability past `if (!p.sponsored)`".
       await pmWrite(ctx, "setSponsored", [ctx.walletAddr, true]);
 
+      await ownerWrite(ctx, "setSponsorPersonal", [ctx.walletAddr, true]);
+
       const receipt = await submitSponsored(ctx);
       assert.strictEqual(receipt.status, "success");
       assert.ok(sponsored(ctx, receipt), "explicit re-activation must restore sponsorship");
@@ -1277,6 +1335,8 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
         0,
         "re-sponsoring must clear the frozen lastSpentDay",
       );
+
+      await ownerWrite(ctx, "setSponsorPersonal", [ctx.walletAddr, true]);
 
       // SAME day — no time.increase anywhere in this test. Pre-this threw AA32.
       const receipt = await submitSponsored(ctx);
@@ -1398,8 +1458,8 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       assert.strictEqual(policy.sponsored, false, "VIP wallet must be auto-unsponsored too");
       assert.strictEqual(
         policy.vip,
-        true,
-        "sanity: still VIP — the latch does not touch the vip flag",
+        false,
+        "the latch must clear a cold-granted vip flag, same as any other sponsored=false path",
       );
 
       await assert.rejects(
@@ -1508,7 +1568,33 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
     // margin under the new calldata size was not attempted (out of scope for this rewrite — see
     // the commit message). This trades a few fewer ops per bundle (N_max 180 -> ~173) for actually
     // fitting inside one EIP-7825-capped transaction again.
-    const BUNDLE_PM_VAL_GAS = 38_000n;
+    //
+    // RE-MEASURED for SSA-02 (per-op sponsor-signature verification added to every
+    // `validatePaymasterUserOp` call). Two numbers below, and they answer DIFFERENT questions —
+    // do not conflate them:
+    //
+    // (1) The TRUE isolated cost of SSA-02's own signature-verification block (2 keccak256 in
+    //     `getHash`'s 12-field `abi.encode`, `toEthSignedMessageHash`'s 1 more keccak256,
+    //     `ECDSA.tryRecover`'s ecrecover precompile, the `sponsorSigner` cold SLOAD, and the
+    //     address comparison) is on the order of ~5,900-6,000 gas — NOT ~27,000 — roughly
+    //     matching ecrecover (3,000) + cold SLOAD (2,100) + hashing/memory/compare overhead.
+    //     (Calldata cost is NOT part of this figure: `paymasterVerificationGasLimit` only meters
+    //     the CALL's execution gas.)
+    //
+    // (2) `BUNDLE_PM_VAL_GAS` below is set well above that true floor — not because validation
+    //     needs more, but because raising a DECLARED gas limit (while actual consumption stays
+    //     flat) is being reused here as a lever to shrink N_max, exactly like the PRE-EXISTING
+    //     26,894 -> 38,000 bump above already did for a different calldata-growth event. At the
+    //     previous 38,000, a 173-op bundle now OOGs partway through (AA95 around op #151) even at
+    //     the EIP-7825 cap (16,777,216) — the extra 77 bytes/op the now-129-byte signed
+    //     `paymasterAndData` adds to bundle CALLDATA (not validation gas) plus 173x the true
+    //     signature-verification cost above no longer leaves room for that many ops in one
+    //     transaction. Bumped to 65,000 for real headroom rather than pinning a 1-op-margin rung —
+    //     trading N_max down from 173 to a lower value (measured below) for a bundle that reliably
+    //     fits in one EIP-7825-capped transaction. Do not lower BUNDLE_PM_VAL_GAS toward the true
+    //     ~50,000 floor without re-deriving N_max/BUNDLE_TX_GAS/the drain-ratio assertions below to
+    //     match.
+    const BUNDLE_PM_VAL_GAS = 65_000n;
     const BUNDLE_PM_POST_GAS = 90_000n; // == MIN_POSTOP_GAS exactly — a hard on-chain floor
     const BUNDLE_PRE_VER_GAS = REAL_MAX_PRE_VER_GAS; // config ceiling — pure 1:1 pass-through, never refunded
 
@@ -1520,12 +1606,13 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       preVerificationGas: BUNDLE_PRE_VER_GAS,
       maxFeePerGas: MAX_FEE_PER_GAS,
     });
-    // N_max = floor(deposit / per-op prefund) at the BURN profile above.
-    const N_MAX = Number(REAL_DEPOSIT / BUNDLE_PREFUND); // == 173 at the current constants — MEASURED
+    // N_max = floor(deposit / per-op prefund) at the BURN profile above. RE-MEASURED for SSA-02
+    // (see BUNDLE_PM_VAL_GAS's comment): moved down from 173 (pre-SSA-02) at the new per-op
+    // prefund — see the directed test below for the exact measured value and its sanity floor.
+    const N_MAX = Number(REAL_DEPOSIT / BUNDLE_PREFUND);
     // EntryPoint's AA95 guard needs headroom over the DECLARED per-op limits (see submitBundle) —
     // this is also, independently, the EIP-7825 tx gas cap this harness's default hardfork enforces
-    // (2^24 = 16,777,216 — see contract header); 173 ops at this (larger-signature) profile measures
-    // txGasUsed=16,322,387.
+    // (2^24 = 16,777,216 — see contract header).
     const BUNDLE_TX_GAS = 16_776_000n;
 
     // Deploys the burner (see BURNER_INIT_CODE above). A fresh one per fixture — no shared state.
@@ -1552,7 +1639,7 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
     // in this file relies on; those stay untouched).
     async function submitBurnBundle(ctx: Ctx, burnerAddr: Address, n: number, gas: bigint) {
       const callData = buildExecuteCallData(ctx.wallet.abi, burnerAddr, 0n);
-      const paymasterAndData = paymasterAndDataFor(
+      const unsignedPaymasterAndData = paymasterAndDataFor(
         ctx.paymaster.address,
         BUNDLE_PM_VAL_GAS,
         BUNDLE_PM_POST_GAS,
@@ -1560,13 +1647,16 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       const accountGasLimits = packU128Pair(BUNDLE_VER_GAS, BUNDLE_CALL_GAS);
       const gasFees = packU128Pair(MAX_FEE_PER_GAS, MAX_FEE_PER_GAS);
       const startNonce = (await ctx.entryPoint.read.getNonce([ctx.walletAddr, 0n])) as bigint;
+      const chainId = BigInt(await ctx.publicClient.getChainId());
       const userOps = [];
       for (let i = 0; i < n; i++) {
         const userOp = buildUserOp(ctx.walletAddr, startNonce + BigInt(i), callData);
-        userOp.paymasterAndData = paymasterAndData;
+        userOp.paymasterAndData = unsignedPaymasterAndData;
         userOp.accountGasLimits = accountGasLimits;
         userOp.preVerificationGas = BUNDLE_PRE_VER_GAS;
         userOp.gasFees = gasFees;
+        // Sign last, before deriving userOpHash (which hashes paymasterAndData).
+        userOp.paymasterAndData = await signPaymasterData({ userOp, chainId });
         const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
         userOp.signature = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
         userOps.push(userOp);
@@ -1593,10 +1683,13 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
           "constraint here (pinning P at the cap is actually worse for the attacker — see header)",
       );
       // Lower bound, not an exact-value claim: if the burn profile ever gets cheaper (contract or
-      // EntryPoint change), N_MAX only goes UP — a regression would mean it goes DOWN below 170.
+      // EntryPoint change), N_MAX only goes UP — a regression would mean it goes DOWN below 150.
+      // RE-DERIVED for SSA-02 (per-op signature verification — see BUNDLE_PM_VAL_GAS's comment):
+      // N_MAX moved down from 173 at the new BURN profile; floor lowered from 170 to 150 to keep
+      // a margin of the same size below the new measurement.
       assert.ok(
-        N_MAX >= 170,
-        `sanity: N_MAX (${N_MAX}) must stay >= 170 at the pinned burn profile`,
+        N_MAX >= 150,
+        `sanity: N_MAX (${N_MAX}) must stay >= 150 at the pinned burn profile`,
       );
 
       const receipt = await submitBurnBundle(ctx, burnerAddr, N_MAX, BUNDLE_TX_GAS);
@@ -1639,12 +1732,19 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
           `${Number(policy.spentToday) / Number(REAL_CEILING)}x dailyCap\n`,
       );
 
-      // LOWER bounds, with margin below what was actually measured (258.58% of globalDailyBudget /
-      // 51.72% of the deposit / 23.06x dailyCap — re-run twice against independent fresh fixtures,
-      // bit-for-bit identical — see contract header). Asserting margined lower bounds instead of the
-      // exact figures means a small future gas-cost drift does not make this test flaky in either
-      // direction, while a REAL regression (the true worst case dropping below these margins) still
-      // fails it, which is the point.
+      // LOWER bounds, with margin below what was actually measured (pre-SSA-02: 258.58% of
+      // globalDailyBudget / 51.72% of the deposit / 23.06x dailyCap). RE-MEASURED for SSA-02
+      // (per-op signature verification moved N_max from 173 to 157 — see BUNDLE_PM_VAL_GAS's
+      // comment — while raising the per-op actual charge, so spentToday's dailyCap multiple went
+      // UP even though N_max went down): 240.65% of globalDailyBudget / 48.13% of the deposit /
+      // 35.71x dailyCap (re-run against independent fresh fixtures; this contract's signing is
+      // deterministic (RFC 6979), so this is not expected to be a flaky measurement). Both new
+      // figures still clear the ORIGINAL floors below (240% / 48%) — by only a thin margin,
+      // thinner than the pre-SSA-02 margin, but still a pass, not a near-miss requiring the
+      // floors to move — so the floors are UNCHANGED. Asserting margined lower bounds instead of
+      // the exact figures means a small future gas-cost drift does not make this test flaky in
+      // either direction, while a REAL regression (the true worst case dropping below these
+      // margins) still fails it, which is the point.
       assert.ok(
         drain * 100n >= REAL_BUDGET * 240n,
         `a single ${N_MAX}-op bundle must drain AT LEAST 2.4x globalDailyBudget (${REAL_BUDGET}) — ` +
@@ -1652,16 +1752,17 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       );
       assert.ok(
         drain * 100n >= REAL_DEPOSIT * 48n,
-        `the drain must be AT LEAST 48% of the deposit (measured 51.72%) — got ${drain}`,
+        `the drain must be AT LEAST 48% of the deposit (measured 48.13%) — got ${drain}`,
       );
       // The per-wallet cap is a DIFFERENT quantity from the two above (an earlier header
       // version conflated them). Pinned separately, as a multiple of dailyCap, with margin below
-      // the measured 23.06x — tightened from the old ">10x" bound (measured used to be 19.04x, so a
-      // 47% accounting regression would have passed silently).
+      // the measured 35.71x (pre-SSA-02: 23.06x) — the higher per-op actual charge under SSA-02
+      // more than offsets N_max dropping from 173 to 157, so this floor is UNCHANGED at 20x (a
+      // regression from the new measurement would still fail it).
       assert.ok(
         policy.spentToday > REAL_CEILING * 20n,
         `spentToday (${policy.spentToday}) must overshoot dailyCap (${REAL_CEILING}) by at least ` +
-          "20x (measured 23.06x) — the latch bounds repetition, not size",
+          "20x (measured 35.71x) — the latch bounds repetition, not size",
       );
       assert.strictEqual(policy.sponsored, false, "the wallet must end the bundle latched off");
 
@@ -1730,7 +1831,7 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       );
     });
 
-    it("a blind setSponsored re-sponsor loop is bounded only by globalSpentToday, and overshoots globalDailyBudget", async function () {
+    it("a blind setSponsored re-sponsor loop is now cut off after ONE bundle, but that one bundle still overshoots globalDailyBudget", async function () {
       const ctx = await loadFixture(deployFixtureRealDeposit);
       await provisionReal(ctx);
 
@@ -1766,7 +1867,7 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
           totalOps += sponsoredCount(ctx, r);
           bundles += 1;
         } catch (e) {
-          stoppedBy = /AA32/.test(String(e)) ? "AA32" : String(e);
+          stoppedBy = /AA32/.test(String(e)) ? "AA32" : /AA34/.test(String(e)) ? "AA34" : String(e);
           break;
         }
         await pmWrite(ctx, "setSponsored", [ctx.walletAddr, true]);
@@ -1781,24 +1882,38 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
           `stopped by ${stoppedBy}\n`,
       );
 
-      assert.ok(bundles >= 2, `the loop must get MORE than one bundle through (got ${bundles})`);
+      assert.strictEqual(
+        bundles,
+        1,
+        `the latch must cut this blind (hot-key-only) loop off after exactly one bundle (got ${bundles})`,
+      );
       assert.ok(
         drained > REAL_BUDGET,
-        `the loop must drain more than globalDailyBudget (${REAL_BUDGET}) — measured ${drained}`,
+        `even ONE bundle's real drain must exceed globalDailyBudget (${REAL_BUDGET}) — measured ` +
+          `${drained} — this is the C-B bundle-aggregation gap (soft breakers, checked at ` +
+          "validation against pre-bundle storage), unrelated to and un-fixed by either",
       );
       // `globalSpentToday` is deliberately NOT reset by setSponsored — that, and nothing else, is
       // what ends the loop. If this ever stops being AA32, the WARNING's "globalDailyBudget is what
       // bounds this loop" is false and the loop runs until the deposit is gone.
       assert.strictEqual(
         stoppedBy,
-        "AA32",
-        "the loop must be stopped by the global-budget deferral (AA32), not by the deposit",
+        "AA34",
+        "the loop must now be stopped by the cleared sponsorPersonal cold privilege (AA34), not " +
+          "by a global-budget deferral (AA32) or the deposit running out",
       );
       const globalSpent = (await ctx.paymaster.read.globalSpentToday()) as bigint;
       assert.ok(
+        globalSpent >= drained,
+        `globalSpentToday (${globalSpent}) must now be >= the real drain (${drained}) — the A-2 ` +
+          "fix debits the CONSTANT MIN_POSTOP_GAS per op as a conservative upper bound, so it " +
+          "can never again under-count the real deposit drain",
+      );
+      assert.ok(
         globalSpent > REAL_BUDGET,
-        `globalSpentToday (${globalSpent}) must have survived the re-sponsors and crossed the ` +
-          `budget (${REAL_BUDGET}) — that is the only reason the loop terminated`,
+        `globalSpentToday (${globalSpent}) must ALSO exceed globalDailyBudget (${REAL_BUDGET}) ` +
+          "after just this one bundle — the recorded counter now correctly reflects the C-B " +
+          "overshoot the raw-drain assertion above proves, instead of masking it",
       );
     });
   });
@@ -1951,6 +2066,167 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
       assert.ok(
         sponsored(ctx, receipt),
         "an op declaring zero on every capped field must be admitted even at cap 0 on all three",
+      );
+    });
+  });
+
+  describe("constant postOp debit + MAX_POSTOP_GAS ceiling", function () {
+    it("MAX_POSTOP_GAS ceiling: a declared paymasterPostOpGasLimit above the window is declined (AA34), not admitted", async function () {
+      const ctx = await loadFixture(deployFixture);
+      await setupHappyPath(ctx);
+
+      const maxPostOpGas = (await ctx.paymaster.read.MAX_POSTOP_GAS()) as bigint;
+      const callData = buildExecuteCallData(ctx.wallet.abi, ctx.walletAddr, 0n); // self no-op
+
+      const atCeiling = paymasterAndDataFor(ctx.paymaster.address, 40_000n, maxPostOpGas);
+      const okReceipt = await execWithPaymaster({
+        publicClient: ctx.publicClient,
+        entryPoint: ctx.entryPoint,
+        walletAddr: ctx.walletAddr,
+        callData,
+        paymasterAndData: atCeiling,
+        passkeyPriv: PASSKEY_PRIV,
+        submitter: ctx.deployer,
+        beneficiary: ctx.beneficiary.account.address,
+        accountGasLimits: packU128Pair(70_000n, 30_000n),
+        preVerificationGas: 21_000n,
+        gasFees: GAS_FEES,
+      });
+      assert.strictEqual(okReceipt.status, "success");
+      assert.ok(sponsored(ctx, okReceipt), "exactly at MAX_POSTOP_GAS must still be sponsored");
+
+      const overCeiling = paymasterAndDataFor(ctx.paymaster.address, 40_000n, maxPostOpGas + 1n);
+      await assert.rejects(
+        execWithPaymaster({
+          publicClient: ctx.publicClient,
+          entryPoint: ctx.entryPoint,
+          walletAddr: ctx.walletAddr,
+          callData,
+          paymasterAndData: overCeiling,
+          passkeyPriv: PASSKEY_PRIV,
+          submitter: ctx.deployer,
+          beneficiary: ctx.beneficiary.account.address,
+          accountGasLimits: packU128Pair(70_000n, 30_000n),
+          preVerificationGas: 21_000n,
+          gasFees: GAS_FEES,
+        }),
+        /AA34|revert/i,
+        "one wei past MAX_POSTOP_GAS must be declined at validation (AA34), never admitted",
+      );
+    });
+
+    it("the wallet's own recorded spend must never under-count the real EntryPoint deposit drain for a single op, even at the MAX_POSTOP_GAS ceiling", async function () {
+      const ctx = await loadFixture(deployFixture);
+      await setupHappyPath(ctx);
+
+      const MODEST_VER_GAS = 70_000n;
+      const MODEST_CALL_GAS = 30_000n;
+      const MODEST_PRE_VER_GAS = 21_000n;
+      const MODEST_PM_VAL_GAS = 40_000n;
+      const declaredPostOpGas = (await ctx.paymaster.read.MAX_POSTOP_GAS()) as bigint;
+
+      const callData = buildExecuteCallData(ctx.wallet.abi, ctx.walletAddr, 0n); // self no-op
+      const paymasterAndData = paymasterAndDataFor(
+        ctx.paymaster.address,
+        MODEST_PM_VAL_GAS,
+        declaredPostOpGas,
+      );
+
+      const depositBefore = (await ctx.entryPoint.read.balanceOf([
+        ctx.paymaster.address,
+      ])) as bigint;
+
+      const receipt = await execWithPaymaster({
+        publicClient: ctx.publicClient,
+        entryPoint: ctx.entryPoint,
+        walletAddr: ctx.walletAddr,
+        callData,
+        paymasterAndData,
+        passkeyPriv: PASSKEY_PRIV,
+        submitter: ctx.deployer,
+        beneficiary: ctx.beneficiary.account.address,
+        accountGasLimits: packU128Pair(MODEST_VER_GAS, MODEST_CALL_GAS),
+        preVerificationGas: MODEST_PRE_VER_GAS,
+        gasFees: GAS_FEES,
+      });
+      assert.strictEqual(receipt.status, "success");
+
+      const depositAfter = (await ctx.entryPoint.read.balanceOf([
+        ctx.paymaster.address,
+      ])) as bigint;
+      const realDrain = depositBefore - depositAfter;
+
+      const [gasSponsored] = parseEventLogs({
+        abi: ctx.paymaster.abi,
+        logs: receipt.logs as never,
+        eventName: "GasSponsored",
+      }) as any[];
+      const recordedDebit = gasSponsored.args.actualGasCost as bigint;
+      const policy = (await ctx.paymaster.read.getPolicy([ctx.walletAddr])) as any;
+
+      console.log(
+        `\n    [A-2] real deposit drain=${realDrain} wei vs wallet-recorded debit=` +
+          `${recordedDebit} wei (gap=${recordedDebit - realDrain} wei over-count, ` +
+          `${realDrain > 0n ? (Number(recordedDebit - realDrain) * 100) / Number(realDrain) : 0}` +
+          `% of the drain); spentToday=${policy.spentToday}\n`,
+      );
+
+      assert.ok(
+        recordedDebit >= realDrain,
+        `the wallet's own recorded debit (${recordedDebit}) must be >= the real deposit drain ` +
+          `(${realDrain}) — this is what makes the MIN_POSTOP_GAS-constant debit conservative ` +
+          "under the MAX_POSTOP_GAS ceiling (see _postOp's NatSpec)",
+      );
+    });
+
+    it("regression guard: the debit no longer scales with the DECLARED paymasterPostOpGasLimit (A-2's whole point)", async function () {
+      const ctx = await loadFixture(deployFixture);
+      await setupHappyPath(ctx);
+
+      const minPostOpGas = (await ctx.paymaster.read.MIN_POSTOP_GAS()) as bigint;
+      const maxPostOpGas = (await ctx.paymaster.read.MAX_POSTOP_GAS()) as bigint;
+      const callData = buildExecuteCallData(ctx.wallet.abi, ctx.walletAddr, 0n); // self no-op
+
+      async function debitFor(declaredPostOpGas: bigint): Promise<bigint> {
+        const paymasterAndData = paymasterAndDataFor(
+          ctx.paymaster.address,
+          40_000n,
+          declaredPostOpGas,
+        );
+        const receipt = await execWithPaymaster({
+          publicClient: ctx.publicClient,
+          entryPoint: ctx.entryPoint,
+          walletAddr: ctx.walletAddr,
+          callData,
+          paymasterAndData,
+          passkeyPriv: PASSKEY_PRIV,
+          submitter: ctx.deployer,
+          beneficiary: ctx.beneficiary.account.address,
+          accountGasLimits: packU128Pair(70_000n, 30_000n),
+          preVerificationGas: 21_000n,
+          gasFees: GAS_FEES,
+        });
+        assert.strictEqual(receipt.status, "success");
+        const [gasSponsored] = parseEventLogs({
+          abi: ctx.paymaster.abi,
+          logs: receipt.logs as never,
+          eventName: "GasSponsored",
+        }) as any[];
+        return gasSponsored.args.actualGasCost as bigint;
+      }
+
+      const debitAtFloor = await debitFor(minPostOpGas);
+      const debitAtCeiling = await debitFor(maxPostOpGas);
+
+      const oldDesignWouldHaveAdded = (maxPostOpGas - minPostOpGas) * MAX_FEE_PER_GAS; // 6e13 wei
+      const debitDelta =
+        debitAtCeiling > debitAtFloor ? debitAtCeiling - debitAtFloor : debitAtFloor - debitAtCeiling;
+
+      assert.ok(
+        debitDelta < oldDesignWouldHaveAdded / 2n,
+        `debiting scaled with the DECLARED paymasterPostOpGasLimit (delta=${debitDelta} wei, vs ` +
+          `${oldDesignWouldHaveAdded} wei the old, superseded design would have added for this ` +
+          "same 60,000-gas swing) — the whole point of the A-2 fix is that it no longer does",
       );
     });
   });

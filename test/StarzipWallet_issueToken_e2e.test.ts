@@ -77,7 +77,7 @@ describe("StarzipWallet -> TokenFactory.issueToken (E2E, member request)", funct
     const chainId = await publicClient.getChainId();
 
     const entryPoint = await viem.deployContract("TestEntryPoint", []);
-    const walletFactory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+    const walletFactory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
     // 4-bucket TokenFactory core (ERC20 beacon + TokenVestingWallet beacon + proxy).
     const permitSigner = privateKeyToAccount(PERMIT_PRIVATE_KEY);

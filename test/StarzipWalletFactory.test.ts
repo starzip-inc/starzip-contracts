@@ -21,7 +21,7 @@ describe("StarzipWalletFactory", function () {
     const publicClient = await viem.getPublicClient();
 
     const mockEntryPoint = await viem.deployContract("MockEntryPoint", []);
-    const factory = await viem.deployContract("StarzipWalletFactory", [mockEntryPoint.address]);
+    const factory = await viem.deployContract("StarzipWalletFactory", [mockEntryPoint.address, zeroAddress]);
 
     return { factory, mockEntryPoint, owner, user1, publicClient, viem };
   }

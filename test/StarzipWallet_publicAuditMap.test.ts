@@ -116,7 +116,7 @@ async function deployFixture() {
   const chainId = await publicClient.getChainId();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
   const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
   await factory.write.createAccount([[firstOwner], SALT], { account: deployer.account });
@@ -157,7 +157,7 @@ async function passthroughOwnerFixture() {
   const [deployer] = await viem.getWalletClients();
   const publicClient = await viem.getPublicClient();
   const pep = await viem.deployContract("PassthroughEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [pep.address]);
+  const factory = await viem.deployContract("StarzipWalletFactory", [pep.address, zeroAddress]);
   const salt = 811202601n;
   const initialOwners: Hex[] = [
     encodePasskeyOwner(PK_X, PK_Y),
@@ -196,7 +196,7 @@ async function reentrancyFixture() {
   const [deployer] = await viem.getWalletClients();
   const publicClient = await viem.getPublicClient();
   const pep = await viem.deployContract("PassthroughEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [pep.address]);
+  const factory = await viem.deployContract("StarzipWalletFactory", [pep.address, zeroAddress]);
   const owner = encodePasskeyOwner(PK_X, PK_Y);
   await factory.write.createAccount([[owner], SALT], { account: deployer.account });
   const walletAddr = (await factory.read.getAddress([[owner], SALT])) as Address;
@@ -752,7 +752,7 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
       const [deployer, beneficiary] = await viem.getWalletClients();
       const publicClient = await viem.getPublicClient();
       const entryPoint = await viem.deployContract("TestEntryPoint", []);
-      const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+      const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
       // 257 owners: index 0 = passkey A, indices 1..255 = distinct EOAs, index 256 = passkey B.
       // 256 is chosen deliberately — it is the first index a `uint8` cursor CANNOT represent, so
@@ -941,7 +941,7 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
       const [deployer] = await viem.getWalletClients();
       const publicClient = await viem.getPublicClient();
       const entryPoint = await viem.deployContract("TestEntryPoint", []);
-      const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+      const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
       // Capped at 56 owners per wallet. MEASURED, not assumed: `createAccount` costs ~74k gas per
       // owner (n=4 => 475,835 ... n=64 => 4,944,246), and Hardhat's EDR block gas cap here is
@@ -1342,7 +1342,7 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
         assert.strictEqual(await publicClient.getChainId(), 5611, "must be forking opBNB testnet");
 
         const pep = await viem.deployContract("PassthroughEntryPoint", []);
-        const factory = await viem.deployContract("StarzipWalletFactory", [pep.address]);
+        const factory = await viem.deployContract("StarzipWalletFactory", [pep.address, zeroAddress]);
         const owner = encodePasskeyOwner(PK_X, PK_Y);
         await factory.write.createAccount([[owner], SALT], { account: deployer.account });
         const walletAddr = (await factory.read.getAddress([[owner], SALT])) as Address;

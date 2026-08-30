@@ -10,20 +10,25 @@ import { _packValidationData } from "@account-abstraction/contracts/core/Helpers
 import { StarzipWallet } from "./StarzipWallet.sol";
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import { IPaymasterSelectorPolicy } from "../interfaces/IPaymasterSelectorPolicy.sol";
+import { StarzipWalletFactory } from "./StarzipWalletFactory.sol";
+import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 /**
  * @title VerifyingPaymaster
- * @notice Policy-storage gas sponsorship paymaster: each wallet's sponsorship policy lives in
- *         this contract's OWN storage keyed by `userOp.sender`. No per-userOp backend signature
- *         and no external registry read during validation (strict ERC-7562 public-bundler safe
- *         WHILE STAKED — see the `unlockStake()` note below; `unlockStake()` voids that standing silently).
+ * @notice Policy-storage gas sponsorship paymaster: each wallet's standing sponsorship policy
+ *         lives in this contract's OWN storage keyed by `userOp.sender`. As of the SSA-02 fix
+ *         below, admission ALSO requires a per-operation signature from {sponsorSigner} — no
+ *         external registry read during validation either way (strict ERC-7562 public-bundler
+ *         safe WHILE STAKED — see the `unlockStake()` note below; `unlockStake()` voids that
+ *         standing silently).
  * @dev Despite the name (kept deliberately — renaming would churn the deployments key, the
  *      S3-published ABI filename, and every test import for zero security gain; recorded as an
- *      accepted, closed decision), this
- *      contract verifies NO signature, unlike the canonical ERC-4337 `VerifyingPaymaster`
- *      sample it shares a name with. Self-disclosed in the header's "NO GLOBAL LATCH" note below
- *      ("despite the name, {_validatePaymasterUserOp} verifies NO signature") — this line exists
- *      so a reader does not have to reach that paragraph to learn it.
+ *      accepted, closed decision), this contract's name long predated any signature check —
+ *      SSA-02 (CertiK preliminary, 2026-08-28) closed that gap: {_validatePaymasterUserOp} now
+ *      recovers {sponsorSigner} from a signature over {getHash} before any of the standing-policy
+ *      checks below ever run. See {getHash} and {sponsorSigner}'s own NatSpec for the mechanism,
+ *      and the "NO GLOBAL LATCH" note below for what this does and does not close.
  * @dev Inherits BasePaymaster (Ownable2Step). Non-proxy, non-upgradeable — `entryPoint` is
  *      immutable; migration = fresh deploy at a new address. Storage slot table (subclass
  *      storage starts at slot 2; slots 0-1 are Ownable/Ownable2Step):
@@ -37,6 +42,7 @@ import { IPaymasterSelectorPolicy } from "../interfaces/IPaymasterSelectorPolicy
  *                (entry at keccak256(selector, keccak256(target, 8)))
  *        slot 9: maxSponsoredFeePerGas (uint128) | maxSponsoredPreVerificationGas (uint128)
  *        slot 10: selfSelectorAllowlist mapping base (entry at keccak256(selector, 10))
+ *        slot 11: sponsorSigner (address, 20B)
  *
  *      ERC-7562: `_validatePaymasterUserOp` NEVER reads `block.timestamp`/`block.number` and
  *      NEVER writes storage — all it does is a RAW check against stored day-indexed counters,
@@ -297,13 +303,13 @@ import { IPaymasterSelectorPolicy } from "../interfaces/IPaymasterSelectorPolicy
  *      spend crosses it, long before any wallet could drain the deposit this way; see
  *      {setSponsored}'s own NatSpec ("`globalDailyBudget`, not the latch, is the only thing that
  *      bounds this loop") for the same bound stated from a different angle. The industry-standard
- *      fix is not an on-chain latch at all but an OFF-CHAIN PER-OP SIGNATURE GATE, which this
- *      paymaster does not have: despite the name, {_validatePaymasterUserOp} verifies NO
- *      signature (see the note near the top of this file) — sponsorship is decided purely from this
- *      contract's own `walletPolicy` storage, so anyone can permissionlessly push ops for a
- *      sponsored wallet (`handleOps` is public, `beneficiary` is attacker-chosen) and the
- *      on-chain caps are the only defense. Introducing that gate is a tracked follow-up, not a
- *      silent gap.
+ *      fix for this class of gap is an OFF-CHAIN PER-OP SIGNATURE GATE, not another on-chain
+ *      latch — SSA-02 (CertiK preliminary, 2026-08-28) added exactly that: {_validatePaymasterUserOp}
+ *      now recovers {sponsorSigner} from a signature over {getHash} BEFORE any of this contract's
+ *      own `walletPolicy` checks run, so a permissionless `handleOps` call (`beneficiary`
+ *      attacker-chosen) can no longer push an op for a sponsored wallet that the signer has not
+ *      separately approved. The on-chain caps below remain in force as a second, independent
+ *      layer — see {getHash}'s own NatSpec for exactly what the signature covers.
  *
  *      The gap ACROSS DIFFERENT wallets within one bundle (each individually within its OWN
  *      `dailyCap`, but collectively exceeding `globalDailyBudget`) is UNCHANGED by this latch —
@@ -451,6 +457,17 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      more) — if `_postOp`'s logic ever changes, re-run the probe test and re-derive this.
     uint128 public constant MIN_POSTOP_GAS = 90_000;
 
+    uint128 public constant MAX_POSTOP_GAS = 150_000;
+
+    /// @dev Layout of the `paymasterData` tail of `paymasterAndData` (everything past
+    ///      `PAYMASTER_DATA_OFFSET`): `validUntil(6) | validAfter(6) | signature(65)`. Exact-length,
+    ///      not minimum-length: a longer tail would let a caller append bytes that no signature
+    ///      covers, and `ECDSA.tryRecover` accepts only a 65-byte signature anyway.
+    uint256 private constant PAYMASTER_DATA_LENGTH = 77;
+
+    /// @dev Where the 65-byte signature starts inside that tail — i.e. past both timestamps.
+    uint256 private constant SIGNATURE_OFFSET = 12;
+
     /// @dev Mirrors StarzipWallet.MAX_BATCH_SIZE — caps the executeBatch decode loop. Duplicated,
     ///      unpinned (two separate `constant` declarations, not one shared source — see
     ///      StarzipWallet.sol's own `MAX_BATCH_SIZE` NatSpec for the full coupling analysis).
@@ -463,6 +480,11 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      the two copies degrades to a sponsorship mismatch, never an executed batch larger than
     ///      the wallet's own `BatchTooLarge` check actually allows.
     uint256 private constant MAX_BATCH_SIZE = 32;
+
+    uint128 private constant MAX_SPONSORED_OP_COST_CEILING = 1 ether;
+    uint128 private constant MAX_SPONSORED_FEE_PER_GAS_CEILING = 1_000 gwei;
+    uint128 private constant MAX_SPONSORED_PRE_VERIFICATION_GAS_CEILING = 2_000_000;
+
 
     // ============ Structs ============
     struct WalletPolicy {
@@ -488,6 +510,8 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         // entry slot n+1
         uint128 spentToday; // set in postOp only
     }
+
+    address public immutable canonicalFactory;
 
     // ============ State Variables ============
     // slot 2 (packed)
@@ -573,8 +597,26 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      StarzipWallet's upgrade surface — see {setSelfSelector}.
     mapping(bytes4 => bool) public selfSelectorAllowlist;
 
+    // slot 11
+    /// @dev The key that authorizes an INDIVIDUAL operation (SSA-02). Every other piece of state
+    ///      above answers "is this wallet sponsored, and how much may it spend" — a standing
+    ///      policy that cannot judge one operation against another. This field can, and that is
+    ///      why {getHash}'s preimage covers the gas fields: the signer decides what an operation
+    ///      is worth, off chain, where it can see what the operation actually does.
+    ///
+    ///      An EOA, deliberately. {_validatePaymasterUserOp} recovers it with `ECDSA.tryRecover`
+    ///      and never with `SignatureChecker`: the latter falls back to an ERC-1271 `staticcall`
+    ///      into the signer, and an external call during the validation phase is an ERC-7562
+    ///      violation that gets this paymaster throttled by public bundlers.
+    ///
+    ///      Rotatable by the owner ({setSponsorSigner}) and never zero — the constructor rejects
+    ///      `address(0)` and so does the setter, so a failed `ECDSA.tryRecover` (which yields
+    ///      `address(0)`) can never accidentally match a live signer.
+    address public sponsorSigner;
+
     // ============ Events ============
     event PolicyManagerChanged(address indexed previousManager, address indexed newManager);
+    event SponsorSignerChanged(address indexed previousSigner, address indexed newSigner);
     event Paused(address indexed by);
     event Unpaused(address indexed by);
     event GlobalDailyBudgetSet(uint128 budget);
@@ -631,6 +673,10 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      note for why sponsoring a self-upgrade must never be reachable, even by a future
     ///      owner-key mistake.
     error ForbiddenSelfSelector();
+    error ExceedsHardCeiling();
+    error WalletDoesNotTrustThisPaymaster();
+    error WalletNotDeployed();
+    error SignerCannotBeOwner();
 
     // ============ Modifiers ============
     modifier onlyPolicyManager() {
@@ -639,15 +685,56 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     }
 
     /// @param _policyManager Hot backend key; owner may rotate it later via {setPolicyManager}.
+    /// @param _sponsorSigner Hot signing key for the per-operation SSA-02 gate; owner may rotate
+    ///        it later via {setSponsorSigner}. Must not equal the deployer/owner — see that
+    ///        setter's own NatSpec for why the cold and hot keys must never be the same key.
     /// @dev Starts `paused = true` (safe bring-up) and `globalDailyBudget = 0` (disabled) until
     ///      the owner explicitly provisions them — see deploy-aa.ts bring-up order.
-    constructor(IEntryPoint _entryPoint, address _policyManager) BasePaymaster(_entryPoint) {
+    constructor(
+        IEntryPoint _entryPoint,
+        address _policyManager,
+        address _canonicalFactory,
+        address _sponsorSigner
+    ) BasePaymaster(_entryPoint) {
         if (_policyManager == address(0)) revert ZeroAddress();
+        // Unlike `_canonicalFactory`, zero is NOT a supported configuration: a paymaster with no
+        // signer cannot sponsor anything, so accepting zero here would only produce a contract
+        // that declines every op until someone noticed.
+        if (_sponsorSigner == address(0)) revert ZeroAddress();
+        // Same rule as {setSponsorSigner}. `owner()` is the deployer at this point (BasePaymaster
+        // sets it to `msg.sender`), which is precisely the key deploy-aa.ts must not hand to the
+        // signing service.
+        if (_sponsorSigner == owner()) revert SignerCannotBeOwner();
         policyManager = _policyManager;
+        canonicalFactory = _canonicalFactory;
+        sponsorSigner = _sponsorSigner;
         paused = true;
     }
 
     // ============ Owner (cold) ============
+    /// @dev Rotates the per-operation signing key. Owner-only rather than `onlyPolicyManager`:
+    ///      the hot key already grants standing sponsorship via {setSponsored}, so handing it the
+    ///      signing key as well would collapse the two independent approvals this design
+    ///      deliberately keeps apart.
+    ///
+    ///      Rotation invalidates every signature the previous key issued and has not yet been
+    ///      consumed. That is the intent — it is the revocation path for a leaked signer — but it
+    ///      means an in-flight op signed seconds before the rotation lands will decline rather
+    ///      than execute. Drain the queue first for a planned rotation.
+    function setSponsorSigner(address s) external onlyOwner {
+        if (s == address(0)) revert ZeroAddress();
+        // The cold key that can `unpause`, `withdrawTo` and `setPolicyManager` must never be the
+        // key an always-online signing service holds, so the contract refuses it here too — not
+        // just at deploy time.
+        //
+        // `policyManager` is deliberately NOT refused here: sharing it collapses provisioning and
+        // signing into one key, which is an operational choice this contract does not police.
+        if (s == owner()) revert SignerCannotBeOwner();
+        address prev = sponsorSigner;
+        sponsorSigner = s;
+        emit SponsorSignerChanged(prev, s);
+    }
+
     function setPolicyManager(address m) external onlyOwner {
         if (m == address(0)) revert ZeroAddress();
         address prev = policyManager;
@@ -707,6 +794,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      closes was in the VALIDATION path, not in what this setter accepts. {unpause} refuses
     ///      to bring the paymaster live while this is still 0.
     function setMaxSponsoredOpCost(uint128 cost) external onlyOwner {
+        if (cost > MAX_SPONSORED_OP_COST_CEILING) revert ExceedsHardCeiling();
         maxSponsoredOpCost = cost;
         emit MaxSponsoredOpCostSet(cost);
     }
@@ -719,6 +807,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      already flagged separately (a hardcoded, oracle-less 1 gwei ceiling). {unpause}
     ///      refuses to bring the paymaster live while this is still 0.
     function setMaxSponsoredFeePerGas(uint128 fee) external onlyOwner {
+        if (fee > MAX_SPONSORED_FEE_PER_GAS_CEILING) revert ExceedsHardCeiling();
         maxSponsoredFeePerGas = fee;
         emit MaxSponsoredFeePerGasSet(fee);
     }
@@ -728,6 +817,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      {maxSponsoredPreVerificationGas}. {unpause} refuses to bring the paymaster live while
     ///      this is still 0.
     function setMaxSponsoredPreVerificationGas(uint128 gas) external onlyOwner {
+        if (gas > MAX_SPONSORED_PRE_VERIFICATION_GAS_CEILING) revert ExceedsHardCeiling();
         maxSponsoredPreVerificationGas = gas;
         emit MaxSponsoredPreVerificationGasSet(gas);
     }
@@ -767,6 +857,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      grant.
     function setSponsoredUnlimited(address wallet, bool on) external onlyOwner {
         if (wallet == address(0)) revert ZeroAddress();
+        if (on) _requireTrustedPaymaster(wallet);
         WalletPolicy storage p = walletPolicy[wallet];
         if (on && p.dailyCap == 0) revert ZeroCapNotAllowed();
         p.vip = on;
@@ -820,6 +911,21 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             }
         }
         emit TargetSelectorsBatchUpdated(target, len, allowed);
+    }
+
+    function revokeTargetSelectors(address target, bytes4[] calldata selectors) external onlyOwner {
+        if (target == address(0)) revert ZeroAddress();
+        uint256 len = selectors.length;
+        for (uint256 i = 0; i < len; ) {
+            bytes4 selector = selectors[i];
+            if (targetSelectorAllowlist[target][selector]) {
+                targetSelectorAllowlist[target][selector] = false;
+                emit TargetSelectorUpdated(target, selector, false);
+            }
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     /// @dev Reverts `ForbiddenSelfSelector` for the three selectors on StarzipWallet's
@@ -979,11 +1085,14 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      runs.
     function setSponsored(address wallet, bool on) external onlyPolicyManager {
         if (wallet == address(0)) revert ZeroAddress();
+        if (on) _requireTrustedPaymaster(wallet);
         WalletPolicy storage p = walletPolicy[wallet];
         p.sponsored = on;
         if (on) {
             p.spentToday = 0;
             p.lastSpentDay = 0;
+        } else {
+            _clearColdPrivilegesOnRevoke(p, wallet);
         }
         emit SponsoredSet(wallet, on);
     }
@@ -1017,6 +1126,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         if (wallet == address(0)) revert ZeroAddress();
         if (on) {
             if (msg.sender != owner()) revert OwnableUnauthorizedAccount(msg.sender);
+            _requireTrustedPaymaster(wallet);
         } else if (msg.sender != owner() && msg.sender != policyManager) {
             revert NotOwnerOrPolicyManager();
         }
@@ -1032,17 +1142,81 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         for (uint256 i = 0; i < len; ) {
             address wallet = wallets[i];
             if (wallet == address(0)) revert ZeroAddress();
+            if (on) _requireTrustedPaymaster(wallet);
             WalletPolicy storage p = walletPolicy[wallet];
             p.sponsored = on;
             if (on) {
                 p.spentToday = 0;
                 p.lastSpentDay = 0;
+            } else {
+                _clearColdPrivilegesOnRevoke(p, wallet);
             }
             emit SponsoredSet(wallet, on);
             unchecked {
                 ++i;
             }
         }
+    }
+
+    function _requireTrustedPaymaster(address wallet) private view {
+        if (wallet.code.length == 0) revert WalletNotDeployed();
+        (bool ok, bytes memory ret) = wallet.staticcall(abi.encodeWithSignature("trustedPaymaster()"));
+        if (!ok || ret.length != 32 || abi.decode(ret, (address)) != address(this)) {
+            revert WalletDoesNotTrustThisPaymaster();
+        }
+    }
+
+    function setSponsoredCounterfactual(
+        bytes[] calldata owners,
+        uint256 salt,
+        bool on
+    ) external onlyPolicyManager {
+        address wallet = StarzipWalletFactory(canonicalFactory).getAddress(owners, salt);
+        if (wallet.code.length != 0) _requireTrustedPaymaster(wallet);
+        WalletPolicy storage p = walletPolicy[wallet];
+        p.sponsored = on;
+        if (on) {
+            p.spentToday = 0;
+            p.lastSpentDay = 0;
+        } else {
+            _clearColdPrivilegesOnRevoke(p, wallet);
+        }
+        emit SponsoredSet(wallet, on);
+    }
+
+    function setSponsorPersonalCounterfactual(
+        bytes[] calldata owners,
+        uint256 salt,
+        bool on
+    ) external {
+        address wallet = StarzipWalletFactory(canonicalFactory).getAddress(owners, salt);
+        if (wallet.code.length != 0) _requireTrustedPaymaster(wallet);
+        if (on) {
+            if (msg.sender != owner()) revert OwnableUnauthorizedAccount(msg.sender);
+        } else if (msg.sender != owner() && msg.sender != policyManager) {
+            revert NotOwnerOrPolicyManager();
+        }
+        walletPolicy[wallet].sponsorPersonal = on;
+        emit SponsorPersonalSet(wallet, on);
+    }
+
+    function _clearColdPrivilegesOnRevoke(WalletPolicy storage p, address wallet) private {
+        if (p.vip) {
+            p.vip = false;
+            emit VipSet(wallet, false);
+        }
+        if (p.sponsorPersonal) {
+            p.sponsorPersonal = false;
+            emit SponsorPersonalSet(wallet, false);
+        }
+    }
+
+    function revokeSponsorshipOnUpgrade() external {
+        WalletPolicy storage p = walletPolicy[msg.sender];
+        if (!p.sponsored) return;
+        p.sponsored = false;
+        _clearColdPrivilegesOnRevoke(p, msg.sender);
+        emit SponsoredSet(msg.sender, false);
     }
 
     /// @notice Kill-switch: owner OR policyManager can stop the bleeding immediately.
@@ -1066,6 +1240,51 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         return p.lastSpentDay == today ? p.spentToday : 0;
     }
 
+    /**
+     * @dev The exact preimage {sponsorSigner} signs. Public because the signing server has to
+     *      reproduce it byte for byte, and a server that can call this to check itself is worth
+     *      more than a spec paragraph that drifts.
+     *
+     *      `preVerificationGas` and `gasFees` are in here on purpose, and they are what closes
+     *      SSA-02. Those two fields decide what the EntryPoint refunds to the op's own
+     *      `beneficiary`, so a wallet that declares far more than it will spend collects the
+     *      difference out of this paymaster's deposit. No ceiling fixes that — a flat cap is a
+     *      number the wallet may fill regardless of what the op actually costs. Binding them to
+     *      the signature does: inflate either one after the signer approved it and the hash
+     *      changes, the recovered address stops matching, and the op is declined. The gas the
+     *      signer approved is the gas the op must declare.
+     *
+     *      `paymasterAndData[PAYMASTER_VALIDATION_GAS_OFFSET:PAYMASTER_DATA_OFFSET]` is the
+     *      paymaster's own two gas limits, covered for the same reason. The 77-byte tail past
+     *      that offset is NOT covered and cannot be — it holds this very signature.
+     *
+     *      `nonce` makes each signature single-use; `block.chainid` and `address(this)` stop one
+     *      from being replayed onto another chain or another deployment of this contract.
+     */
+    function getHash(
+        PackedUserOperation calldata userOp,
+        uint48 validUntil,
+        uint48 validAfter
+    ) public view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(
+                    userOp.sender,
+                    userOp.nonce,
+                    keccak256(userOp.initCode),
+                    keccak256(userOp.callData),
+                    userOp.accountGasLimits,
+                    uint256(bytes32(userOp.paymasterAndData[PAYMASTER_VALIDATION_GAS_OFFSET:PAYMASTER_DATA_OFFSET])),
+                    userOp.preVerificationGas,
+                    userOp.gasFees,
+                    block.chainid,
+                    address(this),
+                    validUntil,
+                    validAfter
+                )
+            );
+    }
+
     // ============ Paymaster Logic ============
     /**
      * @dev Timestamp-free sponsorship decision. Two outcomes:
@@ -1083,10 +1302,51 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             return ("", _packValidationData(true, 0, 0));
         }
 
+        // Audit SSA-02 (CertiK preliminary, 2026-08-28) — PER-OPERATION AUTHORIZATION.
+        // Every other check in this function is a STANDING decision: a wallet is sponsored or it
+        // is not, and the caps are flat ceilings it may fill however it likes. That is precisely
+        // what SSA-02 reported. Nothing here can judge one operation against another, because the
+        // contract has no way to know what an operation ought to cost. The signer does, off
+        // chain, where it can see what the op actually does — so the judgement is made there and
+        // carried in as a signature over {getHash}, which binds the declared gas fields.
+        //
+        // A missing, malformed or wrong signature DECLINES; it never reverts. Reverting during
+        // validation is what gets a paymaster reputation-throttled by public bundlers
+        // (ERC-7562), and "this op is not sponsored" is exactly what a hard decline already means.
+        //
+        // `validUntil`/`validAfter` ride in the returned validationData, not just in the hash:
+        // signing an expiry the EntryPoint never sees would not expire anything.
+        bytes calldata paymasterData = userOp.paymasterAndData[PAYMASTER_DATA_OFFSET:];
+        if (paymasterData.length != PAYMASTER_DATA_LENGTH) {
+            return ("", _packValidationData(true, 0, 0));
+        }
+        uint48 sigValidUntil = uint48(bytes6(paymasterData[0:6]));
+        uint48 sigValidAfter = uint48(bytes6(paymasterData[6:SIGNATURE_OFFSET]));
+        (address recovered, ECDSA.RecoverError recoverErr, ) = ECDSA.tryRecover(
+            MessageHashUtils.toEthSignedMessageHash(getHash(userOp, sigValidUntil, sigValidAfter)),
+            paymasterData[SIGNATURE_OFFSET:]
+        );
+        // `recovered == address(0)` is redundant with the `NoError` check and with
+        // {sponsorSigner} never being zero. It is kept as the belt on the braces: this is the one
+        // line where a recovery failure silently reading as a match would sponsor everything.
+        // `validUntil == 0` means "never expires" to the EntryPoint (`Helpers.sol` substitutes
+        // `type(uint48).max`). It is also exactly what an off-chain signer emits when the field is
+        // forgotten, so accepting it makes the safe default the one nobody has to type. Refused:
+        // an unbounded authorization must be an explicit `type(uint48).max`, not an omission.
+        if (sigValidUntil == 0) {
+            return ("", _packValidationData(true, 0, 0));
+        }
+        if (recoverErr != ECDSA.RecoverError.NoError || recovered == address(0) || recovered != sponsorSigner) {
+            return ("", _packValidationData(true, sigValidUntil, sigValidAfter));
+        }
+
         uint128 postOpGas = uint128(
             bytes16(userOp.paymasterAndData[PAYMASTER_POSTOP_GAS_OFFSET:PAYMASTER_DATA_OFFSET])
         );
         if (postOpGas < MIN_POSTOP_GAS) {
+            return ("", _packValidationData(true, 0, 0));
+        }
+        if (postOpGas > MAX_POSTOP_GAS) {
             return ("", _packValidationData(true, 0, 0));
         }
 
@@ -1124,10 +1384,14 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         if (userOp.preVerificationGas > uint256(maxSponsoredPreVerificationGas)) {
             return ("", _packValidationData(true, 0, 0));
         }
-
         address sender = userOp.sender;
         WalletPolicy memory p = walletPolicy[sender];
 
+        if (userOp.initCode.length >= 20) {
+            if (address(bytes20(userOp.initCode[0:20])) != canonicalFactory) {
+                return ("", _packValidationData(true, 0, 0));
+            }
+        }
         if (!p.sponsored) {
             return ("", _packValidationData(true, 0, 0));
         }
@@ -1145,7 +1409,10 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         }
 
         // --- time-dependent caps: RAW check vs stored counters, NO block.timestamp ---
-        uint48 validAfter = 0;
+        // Seeded from the signed window rather than 0: the deferrals below only ever push this
+        // LATER (`if (candidate > validAfter)`), so a signature that is not yet valid stays not
+        // yet valid, and a cap deferral past it still wins.
+        uint48 validAfter = sigValidAfter;
 
         // per-wallet cap (skipped for VIP; VIP still hits the global check below).
         //
@@ -1190,8 +1457,27 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             if (candidate > validAfter) validAfter = candidate;
         }
 
+        // A NOTE ON THE IMPOSSIBLE WINDOW, because the obvious fix here is the wrong one.
+        //
+        // The cap deferrals above can push `validAfter` past the window the signer authorized: a
+        // wallet at its daily cap is deferred to the next UTC day, while a signature is good for
+        // minutes. The result is a window that never opens. Returning a hard decline here to say
+        // so plainly would be worse: the EntryPoint checks `pmAggregator != address(0)` BEFORE it
+        // checks `outOfTimeRange`, so a decline here surfaces to the bundler as `AA34 signature
+        // error` — and a wallet hitting its daily cap is a routine, expected condition, not a
+        // signature problem. Reporting it as one drives this paymaster's `opsSeen`/`opsIncluded`
+        // ratio toward THROTTLED on every public bundler, degrading sponsorship for every user
+        // because one wallet spent its allowance.
+        //
+        // Left as an ordinary sponsor decision, the same op fails the EntryPoint's own range check
+        // and is reported as `AA32 paymaster expired or not due` — accurate, and not a reputation
+        // event. The bundler drops it just as promptly either way.
+        //
+        // Extending `validUntil` to cover the deferral is not on the table: that authorizes the op
+        // past the point the signer agreed to, which is the one thing this mechanism exists to
+        // prevent. The recovery is a fresh signature after the rollover.
         context = abi.encode(sender); // non-empty ALWAYS => postOp accrues (incl. VIP)
-        return (context, _packValidationData(false, 0, validAfter));
+        return (context, _packValidationData(false, sigValidUntil, validAfter));
     }
 
     /**
@@ -1297,17 +1583,19 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         IPaymaster.PostOpMode /*mode*/,
         bytes calldata context,
         uint256 actualGasCost,
-        uint256 /*actualUserOpFeePerGas*/
+        uint256 actualUserOpFeePerGas
     ) internal override {
         address sender = abi.decode(context, (address));
         uint32 today = uint32(block.timestamp / 1 days);
+
+        uint256 totalDebit = actualGasCost + uint256(MIN_POSTOP_GAS) * actualUserOpFeePerGas;
 
         WalletPolicy memory p = walletPolicy[sender];
         if (p.lastSpentDay != today) {
             p.spentToday = 0;
             p.lastSpentDay = today;
         }
-        p.spentToday += uint128(actualGasCost);
+        p.spentToday += uint128(totalDebit);
 
         // Threshold is the SAME `effectiveDailyCap` validation enforces
         // (`min(dailyCap, globalDailyCapCeiling)`), not the raw stored `dailyCap` — otherwise
@@ -1316,6 +1604,14 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         uint128 latchCap = p.dailyCap < globalDailyCapCeiling ? p.dailyCap : globalDailyCapCeiling;
         if (p.sponsored && p.spentToday > latchCap) {
             p.sponsored = false;
+            if (p.vip) {
+                p.vip = false;
+                emit VipSet(sender, false);
+            }
+            if (p.sponsorPersonal) {
+                p.sponsorPersonal = false;
+                emit SponsorPersonalSet(sender, false);
+            }
             emit SponsorshipRevoked(sender, p.spentToday, latchCap);
         }
 
@@ -1325,10 +1621,11 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             globalSpentToday = 0;
             globalLastSpentDay = today;
         }
-        globalSpentToday += uint128(actualGasCost);
+        globalSpentToday += uint128(totalDebit);
 
-        emit GasSponsored(sender, actualGasCost, p.spentToday, globalSpentToday);
+        emit GasSponsored(sender, totalDebit, p.spentToday, globalSpentToday);
     }
+
 
     /**
      * @dev Defensive decode of the wallet's exec surface (never revert; malformed => false).
@@ -1388,6 +1685,14 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             if (n == 0 || n > MAX_BATCH_SIZE) return false; // also caps loop + arithmetic
             uint256 dataStart = lenPos + 32;
             if (dataStart + n * 32 > callData.length) return false; // n<=32 => no overflow
+
+            uint256 offValues = uint256(bytes32(callData[36:68])); // offset relative to callData[4]
+            if (offValues > callData.length - 36) return false; // room for a length word
+            uint256 valuesLenPos = 4 + offValues; // no overflow: offValues bounded above
+            if (valuesLenPos + 32 > callData.length) return false;
+            if (uint256(bytes32(callData[valuesLenPos:valuesLenPos + 32])) != n) return false;
+            uint256 valuesDataStart = valuesLenPos + 32; // <= callData.length by the check above
+            if (valuesDataStart + n * 32 > callData.length) return false; // n<=32 => no overflow
 
             // `funcs` array: length must match `dest`, and each element supplies the selector
             // paired with the dest at the same index.

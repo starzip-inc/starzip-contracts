@@ -216,9 +216,9 @@ contract WalletFactoryInvariantsTest is StdInvariant, Test {
 
     function setUp() public {
         entryPoint = new MockEntryPoint();
-        factory = new StarzipWalletFactory(IEntryPoint(address(entryPoint)));
-        altImplementation = new StarzipWallet(IEntryPoint(address(entryPoint)));
-        secondImplementation = new StarzipWallet(IEntryPoint(address(entryPoint)));
+        factory = new StarzipWalletFactory(IEntryPoint(address(entryPoint)), address(0));
+        altImplementation = new StarzipWallet(IEntryPoint(address(entryPoint)), address(0));
+        secondImplementation = new StarzipWallet(IEntryPoint(address(entryPoint)), address(0));
 
         handler = new WalletFactoryHandler(factory, address(altImplementation), address(secondImplementation));
         targetContract(address(handler));

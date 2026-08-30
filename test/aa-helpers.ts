@@ -18,6 +18,7 @@ import {
   type Abi,
 } from "viem";
 import { p256 } from "@noble/curves/p256";
+import { privateKeyToAccount } from "viem/accounts";
 
 // ============ Owner-set encoding (StarzipWallet multi-owner model) ============
 
@@ -355,6 +356,137 @@ export function paymasterAndDataFor(pm: Address, valGas: bigint, postGas: bigint
   return concatHex([pm, packU128(valGas), packU128(postGas)]);
 }
 
+/**
+ * SSA-02: the per-operation sponsorship signer every paymaster fixture deploys with. A fixed key
+ * so a failing test reproduces byte for byte, and so the golden vector handed to the signing
+ * server is reproducible from this file alone.
+ */
+export const SPONSOR_SIGNER_PRIV: Hex =
+  "0x2a871d0798f97d79848a013d4936a73bf4cc922c825d33c1cf7073dff6d409c6";
+export const sponsorSignerAccount = privateKeyToAccount(SPONSOR_SIGNER_PRIV);
+export const SPONSOR_SIGNER: Address = sponsorSignerAccount.address;
+
+/**
+ * SSA-02 time-window fix: `VerifyingPaymaster._validatePaymasterUserOp` hard declines
+ * `sigValidUntil == 0` — an omitted/default `validUntil` used to mean "never expires" (the
+ * EntryPoint's own `_packValidationData` substitutes `type(uint48).max` for a 0 validUntil), which
+ * made "forgot to set an expiry" and "explicitly unlimited" indistinguishable on the wire. An
+ * unbounded authorization must now be requested explicitly — `signPaymasterData`'s default is this
+ * constant, so every existing caller that never passed `validUntil` keeps signing an
+ * unlimited-expiry window, unchanged, rather than getting silently declined.
+ */
+export const UNLIMITED_VALID_UNTIL: bigint = (1n << 48n) - 1n;
+
+/**
+ * Mirrors `VerifyingPaymaster.getHash` in TypeScript. Deliberately a SECOND implementation rather
+ * than a `getHash()` call: the signing server has to build this preimage on its own, and a test
+ * that just asks the contract would pass even if the two ever disagreed. One test asserts this
+ * function equals the contract's `getHash()`; that assertion is the drift guard, and its output is
+ * the golden vector the server checks itself against.
+ */
+export function paymasterGetHash(params: {
+  userOp: PackedUserOp;
+  paymaster: Address;
+  chainId: bigint;
+  validUntil: bigint;
+  validAfter: bigint;
+}): Hex {
+  const { userOp, paymaster, chainId, validUntil, validAfter } = params;
+  // paymasterAndData[20:52] — the paymaster's own verificationGasLimit | postOpGasLimit pair.
+  const pmGasLimits = BigInt(`0x${userOp.paymasterAndData.slice(2 + 40, 2 + 40 + 64)}`);
+  return keccak256(
+    encodeAbiParameters(
+      [
+        { type: "address" },
+        { type: "uint256" },
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "bytes32" },
+        { type: "uint256" },
+        { type: "uint256" },
+        { type: "bytes32" },
+        { type: "uint256" },
+        { type: "address" },
+        { type: "uint48" },
+        { type: "uint48" },
+      ],
+      [
+        userOp.sender,
+        userOp.nonce,
+        keccak256(userOp.initCode),
+        keccak256(userOp.callData),
+        userOp.accountGasLimits,
+        pmGasLimits,
+        userOp.preVerificationGas,
+        userOp.gasFees,
+        chainId,
+        paymaster,
+        validUntil,
+        validAfter,
+      ],
+    ),
+  );
+}
+
+/**
+ * Return a copy of `userOp` whose `paymasterAndData` carries a valid signed tail. For tests that
+ * drive `validatePaymasterUserOp` directly instead of going through `execWithPaymaster`, which
+ * signs on its own.
+ *
+ * Sign LAST. Every gas field is inside the preimage, so mutating the op after this returns
+ * silently invalidates the signature — and the only symptom is a decline that looks exactly like a
+ * policy decline.
+ */
+export async function withSignedPaymasterData<T extends PackedUserOp>(
+  userOp: T,
+  chainId: bigint,
+  opts?: { validUntil?: bigint; validAfter?: bigint; signerPriv?: Hex },
+): Promise<T> {
+  return {
+    ...userOp,
+    paymasterAndData: await signPaymasterData({ userOp, chainId, ...opts }),
+  };
+}
+
+/**
+ * Append a valid `validUntil | validAfter | signature` tail to a 52-byte `paymasterAndData`.
+ * Returns the full 129-byte field. `signerPriv` defaults to the fixture signer; pass a different
+ * key (or mutate the result) to build the decline cases.
+ */
+export async function signPaymasterData(params: {
+  userOp: PackedUserOp;
+  chainId: bigint;
+  validUntil?: bigint;
+  validAfter?: bigint;
+  signerPriv?: Hex;
+}): Promise<Hex> {
+  const {
+    userOp,
+    chainId,
+    validUntil = UNLIMITED_VALID_UNTIL,
+    validAfter = 0n,
+    signerPriv,
+  } = params;
+  const prefix = userOp.paymasterAndData.slice(0, 2 + 52 * 2) as Hex;
+  const paymaster = `0x${userOp.paymasterAndData.slice(2, 42)}` as Address;
+  const withWindow = concatHex([
+    prefix,
+    pad(toHex(validUntil), { size: 6 }),
+    pad(toHex(validAfter), { size: 6 }),
+  ]);
+  const hash = paymasterGetHash({
+    userOp: { ...userOp, paymasterAndData: withWindow },
+    paymaster,
+    chainId,
+    validUntil,
+    validAfter,
+  });
+  const account = signerPriv ? privateKeyToAccount(signerPriv) : sponsorSignerAccount;
+  // `signMessage({raw})` is EIP-191, matching the contract's `toEthSignedMessageHash`.
+  const signature = await account.signMessage({ message: { raw: hash } });
+  return concatHex([withWindow, signature]);
+}
+
 // Build callData for wallet.execute(target, value, data) — used for both the business path
 // (target in the paymaster's businessAllowlist) and the personal path (target not allowlisted).
 export function buildExecuteCallData(
@@ -552,6 +684,14 @@ export async function execWithPaymaster(params: {
   if (accountGasLimits) userOp.accountGasLimits = accountGasLimits;
   if (preVerificationGas !== undefined) userOp.preVerificationGas = preVerificationGas;
   if (gasFees) userOp.gasFees = gasFees;
+  // SSA-02: a bare 52-byte field is the "just sponsor it" shorthand every pre-SSA-02 test was
+  // written against. Sign it here, AFTER the gas overrides above, because those fields are inside
+  // the signed preimage — signing earlier would produce a signature for a different operation.
+  // A caller that already appended a tail (or is testing a bad one) is left alone.
+  if (userOp.paymasterAndData.length === 2 + 52 * 2) {
+    const chainId = BigInt(await publicClient.getChainId());
+    userOp.paymasterAndData = await signPaymasterData({ userOp, chainId });
+  }
   const userOpHash = (await entryPoint.read.getUserOpHash([userOp])) as Hex;
   userOp.signature = encodeSignatureWrapper(ownerIndex, webauthnSignature(userOpHash, passkeyPriv));
 

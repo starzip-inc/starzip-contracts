@@ -60,7 +60,7 @@ async function deployFixture() {
   const publicClient = await viem.getPublicClient();
 
   const entryPoint = await viem.deployContract("TestEntryPoint", []);
-  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address]);
+  const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
   const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
   await factory.write.createAccount([[firstOwner], SALT], {
@@ -489,7 +489,7 @@ describe("StarzipWallet v2 (multi-owner)", function () {
     it("upgrade timelock boundary: fails at T-1, succeeds exactly at T", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
 
       await selfCall(
         ctx,
@@ -517,6 +517,74 @@ describe("StarzipWallet v2 (multi-owner)", function () {
       assert.ok(opSucceeded(rOk, entryPoint.abi), "must succeed exactly at T");
     });
 
+    it("_authorizeUpgrade proceeds even when the paymaster revoke call reverts", async function () {
+      const { viem, entryPoint, deployer, beneficiary, publicClient } =
+        await loadFixture(deployFixture);
+
+      const revertingPaymaster = await viem.deployContract("RevertingPaymasterStub", []);
+      const factory = await viem.deployContract("StarzipWalletFactory", [
+        entryPoint.address,
+        revertingPaymaster.address,
+      ]);
+      const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
+      const salt = 777n;
+      await factory.write.createAccount([[firstOwner], salt], { account: deployer.account });
+      const walletAddr = (await factory.read.getAddress([[firstOwner], salt])) as Address;
+      const account = await viem.getContractAt("StarzipWallet", walletAddr);
+      await deployer.sendTransaction({ to: walletAddr, value: parseEther("2") });
+
+      assert.strictEqual(
+        getAddress(await account.read.trustedPaymaster()),
+        getAddress(revertingPaymaster.address),
+        "precondition: this wallet names the always-reverting stub",
+      );
+
+      const ctx = { viem, publicClient, entryPoint, account, walletAddr, deployer, beneficiary };
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
+
+      await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "requestUpgrade",
+          args: [newImpl.address],
+        }),
+      );
+      await time.increase(UPGRADE_TIMELOCK);
+      const upR = await selfCall(
+        ctx,
+        encodeFunctionData({
+          abi: account.abi,
+          functionName: "upgradeToAndCall",
+          args: [newImpl.address, "0x"],
+        }),
+      );
+      assert.ok(
+        opSucceeded(upR, entryPoint.abi),
+        "the upgrade must succeed even though the paymaster's revoke call reverted",
+      );
+      assert.strictEqual(
+        await account.read.hasBeenUpgraded(),
+        true,
+        "the implementation must have actually been swapped, not merely attempted",
+      );
+
+      const notif = parseEventLogs({
+        abi: account.abi,
+        logs: upR.logs,
+        eventName: "PaymasterUpgradeNotification",
+      })[0] as any;
+      assert.strictEqual(
+        getAddress(notif.args.paymaster),
+        getAddress(revertingPaymaster.address),
+      );
+      assert.strictEqual(
+        notif.args.success,
+        false,
+        "PaymasterUpgradeNotification must honestly report the push failed",
+      );
+    });
+
     it("emits AddOwner(index,owner) and UpgradeRequested(readyAt = now + 48h)", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
@@ -539,7 +607,7 @@ describe("StarzipWallet v2 (multi-owner)", function () {
       assert.strictEqual(ao.args.owner, encodePasskeyOwner(NEW_PK_X, NEW_PK_Y));
 
       // request upgrade with the NEW owner (index 1); assert readyAt == upgradeRequestedAt + 48h
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
       const reqR = await execViaPasskey({
         publicClient: ctx.publicClient,
         entryPoint: ctx.entryPoint,
@@ -568,7 +636,7 @@ describe("StarzipWallet v2 (multi-owner)", function () {
     it("addOwnerPublicKey cancels a pending upgrade (P1-2 incident-response, extended to owner-set changes)", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
 
       await selfCall(
         ctx,
@@ -611,7 +679,7 @@ describe("StarzipWallet v2 (multi-owner)", function () {
     it("removeOwnerAtIndex cancels a pending upgrade too", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
 
       await selfCall(
         ctx,
@@ -764,7 +832,7 @@ describe("StarzipWallet v2 (multi-owner)", function () {
     it("owner set survives a full admin lifecycle (add, request+cancel upgrade, request+execute upgrade)", async function () {
       const ctx = await loadFixture(deployFixture);
       const { account, viem, entryPoint } = ctx;
-      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address]);
+      const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
 
       await selfCall(
         ctx,

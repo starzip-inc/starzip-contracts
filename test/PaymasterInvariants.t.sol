@@ -11,6 +11,7 @@ import { StdAssertions } from "forge-std/StdAssertions.sol";
 import { IEntryPoint } from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
 import { IPaymaster } from "@account-abstraction/contracts/interfaces/IPaymaster.sol";
 import { PackedUserOperation } from "@account-abstraction/contracts/interfaces/PackedUserOperation.sol";
+import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/MessageHashUtils.sol";
 
 import { VerifyingPaymaster } from "../contracts/wallet/VerifyingPaymaster.sol";
 import { MockEntryPoint } from "../contracts/mocks/MockEntryPoint.sol";
@@ -36,11 +37,28 @@ import { StarzipWallet } from "../contracts/wallet/StarzipWallet.sol";
  *      A3 per-wallet spend    — `spentToday` never decreases while `lastSpentDay` is unchanged.
  *      A4 global spend        — same for the global counter.
  */
+contract TrustedPaymasterStub {
+    address public immutable trustedPaymaster;
+
+    constructor(address _trustedPaymaster) {
+        trustedPaymaster = _trustedPaymaster;
+    }
+}
+
 contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
     VerifyingPaymaster public immutable paymaster;
     address public immutable entryPoint;
     address public immutable policyManager;
     address public immutable paymasterOwner;
+    /// @dev SSA-02 (2026-08-31 follow-up): `validate()` used to build a bare 52-byte
+    ///      `paymasterAndData`, which now unconditionally declines at the NEW per-op signature
+    ///      check — BEFORE `sponsored`/postOpGas/maxCost/self-target are ever reached (see that
+    ///      check's position in `_validatePaymasterUserOp`, right after `paused`). That made every
+    ///      B2/B3/B4/B6 inline assert below trivially true for the WRONG reason (the missing
+    ///      signature, not the guard each one claims to isolate), and made B5's `!sigFail` branch
+    ///      dead code. `validate()` now signs for real with this key, so the ONLY thing that can
+    ///      still decline an otherwise-eligible op is the actual guard under test.
+    uint256 internal immutable sponsorSignerPk;
 
     address[3] public wallets;
 
@@ -69,15 +87,34 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
     ///      inline B1-B7 asserts below do not check on their own (they only assert "IF declined-
     ///      condition THEN sigFail", never "IF nothing declines it THEN NOT sigFail").
     bool public lastValidateSigFail;
+    /// @dev SSA-02 follow-up: count of `validate()` calls that were genuinely ADMITTED
+    ///      (`!sigFail`). Before the signing fix this was structurally always 0 — `validate()`
+    ///      could never reach the SPONSOR branch at all, which is exactly what made B5 dead code.
+    ///      `afterInvariant` below asserts this is nonzero, so a regression that makes `validate()`
+    ///      unable to ever admit an op (e.g. the signing logic breaking again) fails LOUD instead
+    ///      of silently going back to vacuous B2-B6/dead-B5.
+    uint256 public callsValidateAdmitted;
 
-    constructor(VerifyingPaymaster _paymaster, address _entryPoint, address _policyManager, address _owner) {
+    constructor(
+        VerifyingPaymaster _paymaster,
+        address _entryPoint,
+        address _policyManager,
+        address _owner,
+        uint256 _sponsorSignerPk
+    ) {
         paymaster = _paymaster;
         entryPoint = _entryPoint;
         policyManager = _policyManager;
         paymasterOwner = _owner;
+        sponsorSignerPk = _sponsorSignerPk;
         wallets[0] = address(0xAA01);
         wallets[1] = address(0xAA02);
         wallets[2] = address(0xAA03);
+        TrustedPaymasterStub stub = new TrustedPaymasterStub(address(_paymaster));
+        bytes memory stubCode = address(stub).code;
+        for (uint256 i = 0; i < 3; i++) {
+            vm.etch(wallets[i], stubCode);
+        }
     }
 
     function _wallet(uint256 seed) internal view returns (address) {
@@ -92,7 +129,12 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
         bool sponsoredBefore = paymaster.getPolicy(w).sponsored;
 
         vm.prank(entryPoint);
-        try paymaster.postOp(IPaymaster.PostOpMode.opSucceeded, abi.encode(w), gasCost, 0) {
+        try paymaster.postOp(
+            IPaymaster.PostOpMode.opSucceeded,
+            abi.encode(w, uint128(0)),
+            gasCost,
+            0
+        ) {
             callsPostOp++;
             VerifyingPaymaster.WalletPolicy memory p = paymaster.getPolicy(w);
             if (sponsoredBefore && !p.sponsored) {
@@ -252,6 +294,32 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
             signature: ""
         });
 
+        // SSA-02 (2026-08-31 follow-up): sign for real, the same way the positive control test
+        // does — preimage from the contract's own `getHash`, no expiry window. Without this, EVERY
+        // call here declined at the signature check alone (before `sponsored`/postOpGas/maxCost/
+        // self-target are ever reached), making B2/B3/B4/B6 pass for the wrong reason and B5 dead
+        // code. Signed unconditionally (not just when the fuzzed fields would otherwise admit the
+        // op) so the ONLY thing that can still decline an eligible op is the guard under test.
+        //
+        // SSA-02 time-window follow-up (2026-08-31, second pass): `_validatePaymasterUserOp` now
+        // HARD-DECLINES `validUntil == 0` (fail-open default blocked — an unbounded window must be
+        // requested explicitly). `0` here used to mean "no expiry window" to the EntryPoint
+        // (`Helpers.sol` substituted `type(uint48).max`); it must now be spelled out, or every call
+        // through this handler declines at the validUntil check alone, for the same reason the
+        // pre-existing comment above describes for a missing signature.
+        uint48 validUntil = type(uint48).max;
+        uint48 validAfter = 0;
+        bytes32 hash = paymaster.getHash(op, validUntil, validAfter);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(sponsorSignerPk, MessageHashUtils.toEthSignedMessageHash(hash));
+        op.paymasterAndData = abi.encodePacked(
+            address(paymaster),
+            pmValGas,
+            pmPostGas,
+            validUntil,
+            validAfter,
+            abi.encodePacked(r, s, v)
+        );
+
         bool pausedBefore = paymaster.paused();
         VerifyingPaymaster.WalletPolicy memory pBefore = paymaster.getPolicy(w);
         uint128 opCostCapBefore = paymaster.maxSponsoredOpCost();
@@ -290,6 +358,7 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
             }
             // B5 — not sigFail => non-empty context (so postOp always accrues, incl. VIP).
             if (!sigFail) {
+                callsValidateAdmitted++;
                 assertTrue(context.length > 0, "B5: a sponsored op returned an empty context");
             }
         } catch {
@@ -334,10 +403,24 @@ contract PaymasterInvariantsTest is StdInvariant, Test {
     PaymasterHandler internal handler;
 
     address internal policyManager = address(0xB001);
+    /// @dev SSA-02's per-op signer. This suite fuzzes the spend accounting directly via
+    ///      `PaymasterHandler.validate()`, which never supplies a valid per-op signature — every
+    ///      call there declines at the new signature check regardless of any OTHER guard (see
+    ///      that function's own comment). `test_B1234_positiveControl_eligibleOpIsSponsored`
+    ///      below is the one test that DOES need to reach the SPONSOR branch, so this must be a
+    ///      key the test actually holds, not an arbitrary non-zero address.
+    uint256 internal constant SPONSOR_SIGNER_PK = 0xB002B002B002B002B002B002B002B002B002B002B002B002B002B002B002B0;
+    address internal sponsorSigner;
 
     function setUp() public {
+        sponsorSigner = vm.addr(SPONSOR_SIGNER_PK);
         entryPoint = new MockEntryPoint();
-        paymaster = new VerifyingPaymaster(IEntryPoint(address(entryPoint)), policyManager);
+        paymaster = new VerifyingPaymaster(
+            IEntryPoint(address(entryPoint)),
+            policyManager,
+            address(0),
+            sponsorSigner
+        );
         // unpause() now refuses while any of the three per-op caps is unprovisioned
         // (0). Provisioned here at the SAME production values the deploy script ships
         // (MAX_SPONSORED_OP_COST / MAX_SPONSORED_FEE_PER_GAS / MAX_SPONSORED_PREVERIFICATION_GAS)
@@ -350,7 +433,7 @@ contract PaymasterInvariantsTest is StdInvariant, Test {
         paymaster.setGlobalDailyCapCeiling(1e16);
         paymaster.setGlobalDailyBudget(1e17);
 
-        handler = new PaymasterHandler(paymaster, address(entryPoint), policyManager, address(this));
+        handler = new PaymasterHandler(paymaster, address(entryPoint), policyManager, address(this), SPONSOR_SIGNER_PK);
 
         // Seed one sponsored wallet with a cap so the latch is reachable from run one.
         vm.startPrank(policyManager);
@@ -397,7 +480,7 @@ contract PaymasterInvariantsTest is StdInvariant, Test {
 
     function _postOp(address w, uint256 gasCost) internal {
         vm.prank(address(entryPoint));
-        paymaster.postOp(IPaymaster.PostOpMode.opSucceeded, abi.encode(w), gasCost, 0);
+        paymaster.postOp(IPaymaster.PostOpMode.opSucceeded, abi.encode(w, uint128(0)), gasCost, 0);
     }
 
     /// @dev A2 alone cannot see a MISSING latch: with no revoke ever observed its precondition is
@@ -593,10 +676,169 @@ contract PaymasterInvariantsTest is StdInvariant, Test {
     /// @dev Positive control for the four tests above: with NOTHING declining it, the SAME
     ///      otherwise-eligible op must actually be SPONSORED. Without this, an over-tightened
     ///      guard (e.g. `validate` always declining) would make B1-B4 pass for the wrong reason.
+    ///
+    ///      SSA-02 (2026-08-31): unlike B1-B4, this one cannot go through
+    ///      `PaymasterHandler.validate()` — that helper only ever builds a bare 52-byte
+    ///      `paymasterAndData`, which now unconditionally declines at the NEW per-op signature
+    ///      check (added right after the `paused` check, before `sponsored`/postOpGas/maxCost —
+    ///      see `_validatePaymasterUserOp`'s SSA-02 NatSpec), so it can never reach the SPONSOR
+    ///      branch this test exists to prove is reachable. This builds the identical op shape by
+    ///      hand and signs it with `SPONSOR_SIGNER_PK`, deriving the preimage from the contract's
+    ///      own `getHash` (not a hand-reconstructed one) so this test cannot drift from what
+    ///      `_validatePaymasterUserOp` actually checks.
     function test_B1234_positiveControl_eligibleOpIsSponsored() public {
         _makeWalletZeroEligible();
+        address w = handler.wallets(0); // == address(0xAA01)
+
+        uint128 verGas = 100_000;
+        uint128 callGas = 100_000;
+        uint128 pmValGas = 50_000;
+        uint128 pmPostGas = uint128(GOOD_POST_GAS);
+        uint256 preVerGas = 50_000;
+        uint128 fee = uint128(GOOD_FEE);
+        uint256 maxCost = GOOD_MAX_COST;
+
+        // Mirrors `PaymasterHandler._buildCallData`'s shape 0 (shapeSeed == 0): a well-formed
+        // `execute` to a foreign target.
+        bytes memory addOwner = abi.encodeWithSelector(StarzipWallet.addOwnerAddress.selector, address(0xC0FFEE));
+        bytes memory callData = abi.encodeWithSelector(StarzipWallet.execute.selector, address(0xB0B0), uint256(0), addOwner);
+
+        PackedUserOperation memory op = PackedUserOperation({
+            sender: w,
+            nonce: 0,
+            initCode: "",
+            callData: callData,
+            accountGasLimits: bytes32((uint256(verGas) << 128) | uint256(callGas)),
+            preVerificationGas: preVerGas,
+            gasFees: bytes32((uint256(fee) << 128) | uint256(fee)),
+            paymasterAndData: abi.encodePacked(address(paymaster), pmValGas, pmPostGas),
+            signature: ""
+        });
+
+        // SSA-02 time-window follow-up (2026-08-31): `validUntil == 0` is now hard-declined (see
+        // the analogous fix in `PaymasterHandler.validate()` above) — this positive control must
+        // sign an EXPLICIT unlimited window, not the omitted default, or it declines at the
+        // validUntil check before ever reaching the branch it means to test.
+        uint48 validUntil = type(uint48).max;
+        uint48 validAfter = 0;
+        bytes32 hash = paymaster.getHash(op, validUntil, validAfter);
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(SPONSOR_SIGNER_PK, MessageHashUtils.toEthSignedMessageHash(hash));
+        bytes memory signature = abi.encodePacked(r, s, v);
+        op.paymasterAndData = abi.encodePacked(address(paymaster), pmValGas, pmPostGas, validUntil, validAfter, signature);
+
+        vm.prank(address(entryPoint));
+        (, uint256 validationData) = paymaster.validatePaymasterUserOp(op, bytes32(0), maxCost);
+        bool sigFail = address(uint160(validationData)) == address(1);
+        assertFalse(sigFail, "positive control: an eligible op must be sponsored, not declined");
+    }
+
+    /// @dev SSA-02 follow-up (2026-08-31): unlike the positive control above (which hand-builds its
+    ///      own op, independent of `PaymasterHandler.validate()`), THIS test drives `validate()`
+    ///      itself — the exact function the invariant fuzz campaign calls — and confirms it can
+    ///      reach the SPONSOR branch now that it signs for real. Before the signing fix this was
+    ///      IMPOSSIBLE: every `validate()` call declined at the signature check alone, regardless of
+    ///      parameters, which made B2/B3/B4/B6's inline asserts pass for the wrong reason (the
+    ///      missing signature, not the guard each one names) and made B5's `!sigFail` branch dead
+    ///      code. Deterministic, not fuzz-luck-dependent — the directed alternative to a "did the
+    ///      random campaign happen to hit this" assertion.
+    function test_handlerValidateCanReachAdmission() public {
+        _makeWalletZeroEligible();
+        assertEq(handler.callsValidateAdmitted(), 0, "precondition: no admission recorded yet");
+
         handler.validate(0, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 0);
-        assertFalse(handler.lastValidateSigFail(), "positive control: an eligible op must be sponsored, not declined");
+
+        assertFalse(
+            handler.lastValidateSigFail(),
+            "handler.validate() must be able to reach the SPONSOR branch on an eligible op"
+        );
+        assertEq(
+            handler.callsValidateAdmitted(),
+            1,
+            "the callsValidateAdmitted ghost must track this admission (restores B5 reachability)"
+        );
+    }
+
+    /// @dev SSA-02 follow-up (2026-08-31): B2/B3/B4 (above, pre-existing) each isolate exactly ONE
+    ///      guard via `_makeWalletZeroEligible`/`_makeEligibleExceptSponsorship` plus ONE bad
+    ///      parameter — see each test's own docstring. That isolation claim depends entirely on
+    ///      `validate()` being ABLE to admit the op when nothing is wrong (proven by
+    ///      `test_handlerValidateCanReachAdmission` above) — otherwise "sigFail" is trivially true
+    ///      for every call and proves nothing. This test cross-checks B2 concretely: the SAME
+    ///      wallet/parameters as `test_B2_unsponsoredOpIsDeclined`, but WITH sponsorship granted,
+    ///      must flip from declined to admitted — demonstrating the earlier decline really was
+    ///      caused by `!sponsored`, not by a missing signature.
+    function test_B2_isolationProof_grantingSponsorshipFlipsTheSameOpToAdmitted() public {
+        _makeEligibleExceptSponsorship(2); // wallet 2 == 0xAA03, matches test_B2's own setup exactly
+        handler.validate(2, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 0);
+        assertTrue(handler.lastValidateSigFail(), "precondition: unsponsored declines, matching test_B2");
+
+        // `vm.prank` only covers the VERY NEXT external call — resolve `wallets(2)` first so it
+        // does not itself consume the prank meant for `setSponsored`.
+        address w2 = handler.wallets(2);
+        vm.prank(policyManager);
+        paymaster.setSponsored(w2, true);
+
+        handler.validate(2, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 0);
+        assertFalse(
+            handler.lastValidateSigFail(),
+            "B2 isolation: the ONLY thing that changed was sponsorship, so the SAME op must now be admitted"
+        );
+    }
+
+    /// @dev SSA-02 follow-up: same isolation proof for B3 — the SAME wallet/op only differs in
+    ///      pmPostGas (0, i.e. below MIN_POSTOP_GAS, vs GOOD_POST_GAS).
+    function test_B3_isolationProof_raisingPostOpGasFlipsTheSameOpToAdmitted() public {
+        _makeWalletZeroEligible();
+        handler.validate(0, 100_000, 100_000, 50_000, 0, 50_000, GOOD_FEE, GOOD_MAX_COST, 0);
+        assertTrue(handler.lastValidateSigFail(), "precondition: postOpGas=0 declines, matching test_B3");
+
+        handler.validate(0, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 0);
+        assertFalse(
+            handler.lastValidateSigFail(),
+            "B3 isolation: the ONLY thing that changed was postOpGas, so the SAME op must now be admitted"
+        );
+    }
+
+    /// @dev SSA-02 follow-up: same isolation proof for B4 — the SAME wallet/op only differs in
+    ///      maxCost (above vs at/below maxSponsoredOpCost).
+    function test_B4_isolationProof_loweringMaxCostFlipsTheSameOpToAdmitted() public {
+        _makeWalletZeroEligible();
+        handler.setDailyCap(0, 1e16); // == globalDailyCapCeiling, matching test_B4's own setup
+        handler.validate(0, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, 0.002 ether, 0);
+        assertTrue(handler.lastValidateSigFail(), "precondition: maxCost above the cap declines, matching test_B4");
+
+        handler.validate(0, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 0);
+        assertFalse(
+            handler.lastValidateSigFail(),
+            "B4 isolation: the ONLY thing that changed was maxCost, so the SAME op must now be admitted"
+        );
+    }
+
+    /// @dev SSA-02 follow-up: isolation proof for B6 — an unallowlisted self-target declines while
+    ///      `sponsorPersonal` is off, and the SAME op is admitted once `sponsorPersonal` is granted
+    ///      (the escape hatch `_makeWalletZeroEligible` normally grants up front; here it is proven
+    ///      as a BEFORE/AFTER flip instead of only ever exercised already-open).
+    function test_B6_isolationProof_grantingSponsorPersonalFlipsSelfTargetedOpToAdmitted() public {
+        // Deliberately NOT `_makeEligibleExceptSponsorship`/`_makeWalletZeroEligible` — both grant
+        // sponsorPersonal up front, which is exactly the guard this test needs to start OFF.
+        address w1 = handler.wallets(1); // wallet 1 == 0xAA02
+        vm.startPrank(policyManager);
+        paymaster.setDailyCap(w1, 1e14);
+        paymaster.setSponsored(w1, true);
+        vm.stopPrank();
+
+        // shapeSeed % 5 == 4 => self-targeted (see _buildCallData); sponsorPersonal still OFF.
+        handler.validate(1, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 4);
+        assertTrue(handler.lastValidateSigFail(), "precondition: unallowlisted self-target declines, matching B6");
+
+        // Owner-only; the test contract itself is the paymaster's owner (it deployed it in setUp).
+        paymaster.setSponsorPersonal(w1, true);
+
+        handler.validate(1, 100_000, 100_000, 50_000, GOOD_POST_GAS, 50_000, GOOD_FEE, GOOD_MAX_COST, 4);
+        assertFalse(
+            handler.lastValidateSigFail(),
+            "B6 isolation: the ONLY thing that changed was sponsorPersonal, so the SAME self-targeted op must now be admitted"
+        );
     }
 
     /// @dev M6c (must PASS, no false positive): the exact sequence the first-draft predicate
