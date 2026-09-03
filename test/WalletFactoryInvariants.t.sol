@@ -8,10 +8,12 @@ import { StdCheats } from "forge-std/StdCheats.sol";
 import { StdUtils } from "forge-std/StdUtils.sol";
 
 import { IEntryPoint } from "@account-abstraction/contracts/interfaces/IEntryPoint.sol";
+import { Create2 } from "@openzeppelin/contracts/utils/Create2.sol";
 
 import { StarzipWallet } from "../contracts/wallet/StarzipWallet.sol";
 import { StarzipWalletFactory } from "../contracts/wallet/StarzipWalletFactory.sol";
 import { MockEntryPoint } from "../contracts/mocks/MockEntryPoint.sol";
+import { ERC1967Proxy } from "../contracts/ERC1967Proxy.sol";
 
 /**
  * @title StarzipWallet / Factory invariants — address prediction, idempotency, upgrade staging.
@@ -401,5 +403,115 @@ contract WalletFactoryInvariantsTest is StdInvariant, Test {
         );
         assertEq(w.pendingImplementation(), address(0), "staging not cleared after execution");
         assertEq(w.upgradeRequestedAt(), 0, "clock not cleared after execution");
+    }
+
+    // ------------------------------------------------------------------
+    // SSA-16 — `getAddress` must apply the same owner-set validation `createAccount` (via
+    // `StarzipWallet.initialize` -> `_registerOwner`) applies, before predicting a CREATE2
+    // address, so no fundable-but-never-deployable address is ever handed out.
+    // ------------------------------------------------------------------
+
+    function test_SSA16_getAddressRevertsOnEmptyOwners() public {
+        bytes[] memory owners = new bytes[](0);
+        vm.expectRevert(StarzipWallet.InvalidArrayLength.selector);
+        factory.getAddress(owners, 100);
+    }
+
+    function test_SSA16_getAddressRevertsOnDuplicateOwners() public {
+        bytes memory a = abi.encode(address(0x1234567890123456789012345678901234567890));
+        bytes[] memory owners = new bytes[](2);
+        owners[0] = a;
+        owners[1] = a;
+        vm.expectRevert(StarzipWallet.AlreadyOwner.selector);
+        factory.getAddress(owners, 101);
+    }
+
+    function test_SSA16_getAddressRevertsOnZeroAddressOwner() public {
+        bytes[] memory owners = new bytes[](1);
+        owners[0] = abi.encode(address(0));
+        vm.expectRevert(StarzipWallet.ZeroAddress.selector);
+        factory.getAddress(owners, 102);
+    }
+
+    function test_SSA16_getAddressRevertsOnInvalidOwnerBytesLength() public {
+        bytes[] memory owners = new bytes[](1);
+        owners[0] = hex"1234"; // neither 32 (address) nor 64 (P-256 key) bytes
+        vm.expectRevert(StarzipWallet.InvalidOwnerBytesLength.selector);
+        factory.getAddress(owners, 103);
+    }
+
+    /// A 32-byte blob whose upper 96 bits are non-zero bare-reverts inside
+    /// `validateOwnerBytes`'s `abi.decode(ownerBytes, (address))` (solc's address-cleanup check),
+    /// with no named error — hence `expectRevert()` with no selector.
+    function test_SSA16_getAddressRevertsOnDirtyEncodedAddress() public {
+        bytes[] memory owners = new bytes[](1);
+        owners[0] = abi.encodePacked(bytes32(type(uint256).max)); // top 12 bytes non-zero
+        vm.expectRevert();
+        factory.getAddress(owners, 104);
+    }
+
+    function test_SSA16_getAddressRevertsOnInvalidPublicKey() public {
+        bytes[] memory owners = new bytes[](1);
+        // Off-curve garbage — not the generator point or any of its known-good multiples.
+        owners[0] = abi.encode(bytes32(uint256(1)), bytes32(uint256(2)));
+        vm.expectRevert(StarzipWallet.InvalidPublicKey.selector);
+        factory.getAddress(owners, 105);
+    }
+
+    /// createAccount's and getAddress's accepted sets must be identical: every input `getAddress`
+    /// rejects above must also be rejected by `createAccount`, with the same error.
+    function test_SSA16_createAccountRejectsEverythingGetAddressRejects() public {
+        vm.expectRevert(StarzipWallet.InvalidArrayLength.selector);
+        factory.createAccount(new bytes[](0), 200);
+
+        bytes memory a = abi.encode(address(0x1234567890123456789012345678901234567890));
+        bytes[] memory dup = new bytes[](2);
+        dup[0] = a;
+        dup[1] = a;
+        vm.expectRevert(StarzipWallet.AlreadyOwner.selector);
+        factory.createAccount(dup, 201);
+
+        bytes[] memory zero = new bytes[](1);
+        zero[0] = abi.encode(address(0));
+        vm.expectRevert(StarzipWallet.ZeroAddress.selector);
+        factory.createAccount(zero, 202);
+
+        bytes[] memory badLen = new bytes[](1);
+        badLen[0] = hex"1234";
+        vm.expectRevert(StarzipWallet.InvalidOwnerBytesLength.selector);
+        factory.createAccount(badLen, 203);
+
+        bytes[] memory offCurve = new bytes[](1);
+        offCurve[0] = abi.encode(bytes32(uint256(1)), bytes32(uint256(2)));
+        vm.expectRevert(StarzipWallet.InvalidPublicKey.selector);
+        factory.createAccount(offCurve, 204);
+    }
+
+    /// REGRESSION — the SSA-16 validation must not change the CREATE2 address predicted for a
+    /// valid owner set. The expected address is recomputed here from `accountImplementation()`,
+    /// `owners` and `salt` rather than by calling `getAddress` twice, so it stays independent of
+    /// the nonce `accountImplementation` deployed at in a given run. Measured against the
+    /// pre-SSA-16 commit (6664bb3): this owner set and `salt = 42` predicted
+    /// `0xd2cfa90b4c78b147B2bBeB5195a36Dc606F182F5` there and still does.
+    function test_SSA16_validOwnerAddressPredictionUnchanged() public view {
+        bytes32 x = bytes32(0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296);
+        bytes32 y = bytes32(0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5);
+        bytes[] memory owners = new bytes[](1);
+        owners[0] = abi.encode(x, y);
+        uint256 salt = 42;
+
+        bytes memory initData = abi.encodeCall(StarzipWallet.initialize, (owners));
+        bytes memory proxyBytecode = abi.encodePacked(
+            type(ERC1967Proxy).creationCode,
+            abi.encode(address(factory.accountImplementation()), initData)
+        );
+        address expected = Create2.computeAddress(bytes32(salt), keccak256(proxyBytecode), address(factory));
+
+        address predicted = factory.getAddress(owners, salt);
+        assertEq(
+            predicted,
+            expected,
+            "SSA-16 fix must not change the CREATE2 address predicted for a valid owner set"
+        );
     }
 }

@@ -517,14 +517,17 @@ describe("StarzipWallet v2 (multi-owner)", function () {
       assert.ok(opSucceeded(rOk, entryPoint.abi), "must succeed exactly at T");
     });
 
-    it("_authorizeUpgrade proceeds even when the paymaster revoke call reverts", async function () {
+    it("_authorizeUpgrade's fallback proceeds even when its OWN (second) revoke call reverts (SSA-01)", async function () {
       const { viem, entryPoint, deployer, beneficiary, publicClient } =
         await loadFixture(deployFixture);
 
-      const revertingPaymaster = await viem.deployContract("RevertingPaymasterStub", []);
+      // Succeeds on requestUpgrade's (first) call and reverts on every call after, so staging
+      // still reaches a pending upgrade while _authorizeUpgrade's second call fails.
+      // `RevertingPaymasterStub` cannot be used here: requestUpgrade is now fail-closed.
+      const recallPaymaster = await viem.deployContract("RevertOnRecallPaymasterStub", []);
       const factory = await viem.deployContract("StarzipWalletFactory", [
         entryPoint.address,
-        revertingPaymaster.address,
+        recallPaymaster.address,
       ]);
       const firstOwner = encodePasskeyOwner(PK_X, PK_Y);
       const salt = 777n;
@@ -535,14 +538,14 @@ describe("StarzipWallet v2 (multi-owner)", function () {
 
       assert.strictEqual(
         getAddress(await account.read.trustedPaymaster()),
-        getAddress(revertingPaymaster.address),
-        "precondition: this wallet names the always-reverting stub",
+        getAddress(recallPaymaster.address),
+        "precondition: this wallet names the revert-on-recall stub",
       );
 
       const ctx = { viem, publicClient, entryPoint, account, walletAddr, deployer, beneficiary };
       const newImpl = await viem.deployContract("StarzipWallet", [entryPoint.address, zeroAddress]);
 
-      await selfCall(
+      const reqR = await selfCall(
         ctx,
         encodeFunctionData({
           abi: account.abi,
@@ -550,6 +553,12 @@ describe("StarzipWallet v2 (multi-owner)", function () {
           args: [newImpl.address],
         }),
       );
+      assert.ok(
+        opSucceeded(reqR, entryPoint.abi),
+        "requestUpgrade's primary revoke call must succeed, so the upgrade gets staged",
+      );
+      assert.strictEqual(await recallPaymaster.read.called(), true);
+
       await time.increase(UPGRADE_TIMELOCK);
       const upR = await selfCall(
         ctx,
@@ -561,7 +570,8 @@ describe("StarzipWallet v2 (multi-owner)", function () {
       );
       assert.ok(
         opSucceeded(upR, entryPoint.abi),
-        "the upgrade must succeed even though the paymaster's revoke call reverted",
+        "the upgrade must succeed even though _authorizeUpgrade's own fallback revoke call " +
+          "reverted — that call is deliberately non-reverting",
       );
       assert.strictEqual(
         await account.read.hasBeenUpgraded(),
@@ -576,12 +586,12 @@ describe("StarzipWallet v2 (multi-owner)", function () {
       })[0] as any;
       assert.strictEqual(
         getAddress(notif.args.paymaster),
-        getAddress(revertingPaymaster.address),
+        getAddress(recallPaymaster.address),
       );
       assert.strictEqual(
         notif.args.success,
         false,
-        "PaymasterUpgradeNotification must honestly report the push failed",
+        "PaymasterUpgradeNotification must report that _authorizeUpgrade's own push failed",
       );
     });
 

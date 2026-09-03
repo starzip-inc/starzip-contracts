@@ -1556,7 +1556,11 @@ describe("VerifyingPaymaster — spend-cap regressions", function () {
     // is not a point-by-point log). NOT proven to be the global optimum. The other four fields are
     // re-derived floors, fresh-wallet-measured (see header for why a REUSED wallet under-measures
     // `verificationGasLimit` specifically).
-    const BUNDLE_VER_GAS = 62_000n; // bundle-padded — RE-MEASURED (index-bounds fixes added ~100-200 gas per verification): bisection found the floor between 60,100 (fails, AA26) and 60,200 (passes); 62,000 keeps a ~1,800 gas margin, same spirit as the pre-fix 60,000/55,505 pairing.
+    // bundle-padded. RE-MEASURED after SSA-02's padded-length check and SSA-18's ownerEpoch
+    // tstore, both of which now run on every validateUserOp: bisected floor is 62,900 (fails,
+    // AA26) / 62,950 (passes), up from 60,100/60,200. 65,000 keeps a ~2,050 gas margin — do not
+    // lower this toward the bisected floor without re-deriving it.
+    const BUNDLE_VER_GAS = 65_000n;
     const BUNDLE_CALL_GAS = 40_000n; // the burn amount — sweep-found plateau, NOT the per-op cap
     // RE-MEASURED for the multi-owner rewrite: `userOp.signature` is now a
     // `SignatureWrapper{ownerIndex, signatureData}` envelope (~128 bytes larger per op than the

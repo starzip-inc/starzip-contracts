@@ -112,7 +112,7 @@ describe("StarzipWalletFactory", function () {
     });
 
     it("should produce different addresses for a differing SECOND owner in the initial set (V2: full owner set is bound into the CREATE2 address)", async function () {
-      const { factory } = await loadFixture(deployFactoryFixture);
+      const { factory, owner } = await loadFixture(deployFactoryFixture);
       const salt = 5n;
       const first = encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y);
 
@@ -120,8 +120,11 @@ describe("StarzipWalletFactory", function () {
         [first, encodePasskeyOwner(ALT_PUB_KEY_X, ALT_PUB_KEY_Y)],
         salt,
       ]);
+      // SSA-16: getAddress now rejects a duplicate owner ([first, first]), so the second owner
+      // here must be a genuinely DIFFERENT (but still valid) owner — not a repeat of `first` — to
+      // keep exercising "differing second owner" rather than the now-rejected duplicate case.
       const addr2 = await factory.read.getAddress([
-        [first, encodePasskeyOwner(TEST_PUB_KEY_X, TEST_PUB_KEY_Y)],
+        [first, encodeAddressOwner(owner.account.address)],
         salt,
       ]);
 

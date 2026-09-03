@@ -110,21 +110,20 @@ describe("StarzipWallet -> TokenFactory.issueToken (E2E, member request)", funct
     };
   }
 
-  it("GAP-1: getAddress(owner=0) computes, but createAccount(owner=0) reverts (ZeroAddress)", async function () {
+  it("GAP-1 / SSA-16: getAddress(owner=0) reverts ZeroAddress instead of computing an undeployable phantom address", async function () {
     const { walletFactory, deployer } = await loadFixture(deployFixture);
     const zeroOwner = encodeAddressOwner(zeroAddress);
-    const phantom = (await walletFactory.read.getAddress([
-      [zeroOwner],
-      MEMBER_SALT_UINT,
-    ])) as Address;
-    assert.ok(phantom && phantom !== zeroAddress);
+    // SSA-16: getAddress runs the same owner-set validation createAccount does
+    // (StarzipWallet.validateOwnerBytes), so it rejects owner=0 with the same error.
+    await assert.rejects(
+      walletFactory.read.getAddress([[zeroOwner], MEMBER_SALT_UINT]) as Promise<Address>,
+      /ZeroAddress/,
+    );
     await assert.rejects(
       walletFactory.write.createAccount([[zeroOwner], MEMBER_SALT_UINT], {
         account: deployer.account,
       }),
-    );
-    console.log(
-      `[GAP-1] owner=0 phantom getAddress = ${phantom} (NOT deployable; createAccount reverts)`,
+      /ZeroAddress/,
     );
   });
 

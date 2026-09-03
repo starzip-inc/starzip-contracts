@@ -54,7 +54,28 @@ contract StarzipWalletFactory {
         return address(proxy);
     }
 
+    /**
+     * @dev SSA-16: rejects every owner set `createAccount` (via `StarzipWallet.initialize` ->
+     *      `_registerOwner`) would reject, so a counterfactual address is never predicted for an
+     *      undeployable set. Shape/value checks come from {StarzipWallet-validateOwnerBytes};
+     *      `_registerOwner`'s storage-backed `isOwnerBytes` duplicate check has no equivalent in a
+     *      `view` call against a not-yet-deployed account, so duplicates are caught pairwise here.
+     */
     function getAddress(bytes[] calldata owners, uint256 salt) public view returns (address) {
+        if (owners.length == 0) revert StarzipWallet.InvalidArrayLength();
+        for (uint256 i = 0; i < owners.length; ) {
+            accountImplementation.validateOwnerBytes(owners[i]);
+            for (uint256 j = 0; j < i; ) {
+                if (keccak256(owners[i]) == keccak256(owners[j])) revert StarzipWallet.AlreadyOwner();
+                unchecked {
+                    ++j;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
+
         bytes memory initData = abi.encodeCall(StarzipWallet.initialize, (owners));
 
         bytes memory proxyBytecode = abi.encodePacked(

@@ -43,6 +43,16 @@ contract TrustedPaymasterStub {
     constructor(address _trustedPaymaster) {
         trustedPaymaster = _trustedPaymaster;
     }
+
+    // SSA-01: `_requireTrustedPaymaster` also staticcalls these and fails closed if either call
+    // itself fails. Same stub as contracts/mocks/TrustedPaymasterStub.sol.
+    function pendingImplementation() external pure returns (address) {
+        return address(0);
+    }
+
+    function hasBeenUpgraded() external pure returns (bool) {
+        return false;
+    }
 }
 
 contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
@@ -291,7 +301,10 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
             preVerificationGas: preVerGas,
             gasFees: bytes32((uint256(fee) << 128) | uint256(fee)),
             paymasterAndData: abi.encodePacked(address(paymaster), pmValGas, pmPostGas),
-            signature: ""
+            // SSA-02: `minSigLen == 0` is hard-declined, so this pairs with `minSigLen = 1`
+            // below. This handler fuzzes the paymaster's own guards, never wallet-side signature
+            // content.
+            signature: hex"00"
         });
 
         // SSA-02 (2026-08-31 follow-up): sign for real, the same way the positive control test
@@ -309,7 +322,10 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
         // pre-existing comment above describes for a missing signature.
         uint48 validUntil = type(uint48).max;
         uint48 validAfter = 0;
-        bytes32 hash = paymaster.getHash(op, validUntil, validAfter);
+        // SSA-02: `getHash` also covers `minSigLen`. `1` is the smallest value that satisfies the
+        // floor while keeping the length check a no-op against the 1-byte placeholder above.
+        uint16 minSigLen = 1;
+        bytes32 hash = paymaster.getHash(op, validUntil, validAfter, minSigLen);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(sponsorSignerPk, MessageHashUtils.toEthSignedMessageHash(hash));
         op.paymasterAndData = abi.encodePacked(
             address(paymaster),
@@ -317,6 +333,7 @@ contract PaymasterHandler is CommonBase, StdCheats, StdUtils, StdAssertions {
             pmPostGas,
             validUntil,
             validAfter,
+            minSigLen,
             abi.encodePacked(r, s, v)
         );
 
@@ -712,7 +729,9 @@ contract PaymasterInvariantsTest is StdInvariant, Test {
             preVerificationGas: preVerGas,
             gasFees: bytes32((uint256(fee) << 128) | uint256(fee)),
             paymasterAndData: abi.encodePacked(address(paymaster), pmValGas, pmPostGas),
-            signature: ""
+            // SSA-02: 1-byte placeholder pairing with `minSigLen = 1` below — see
+            // `PaymasterHandler.validate()`.
+            signature: hex"00"
         });
 
         // SSA-02 time-window follow-up (2026-08-31): `validUntil == 0` is now hard-declined (see
@@ -721,10 +740,12 @@ contract PaymasterInvariantsTest is StdInvariant, Test {
         // validUntil check before ever reaching the branch it means to test.
         uint48 validUntil = type(uint48).max;
         uint48 validAfter = 0;
-        bytes32 hash = paymaster.getHash(op, validUntil, validAfter);
+        // SSA-02: see `PaymasterHandler.validate()`.
+        uint16 minSigLen = 1;
+        bytes32 hash = paymaster.getHash(op, validUntil, validAfter, minSigLen);
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(SPONSOR_SIGNER_PK, MessageHashUtils.toEthSignedMessageHash(hash));
         bytes memory signature = abi.encodePacked(r, s, v);
-        op.paymasterAndData = abi.encodePacked(address(paymaster), pmValGas, pmPostGas, validUntil, validAfter, signature);
+        op.paymasterAndData = abi.encodePacked(address(paymaster), pmValGas, pmPostGas, validUntil, validAfter, minSigLen, signature);
 
         vm.prank(address(entryPoint));
         (, uint256 validationData) = paymaster.validatePaymasterUserOp(op, bytes32(0), maxCost);

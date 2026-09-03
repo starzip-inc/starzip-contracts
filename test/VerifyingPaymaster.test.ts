@@ -907,6 +907,85 @@ describe("VerifyingPaymaster (policy-storage)", function () {
       );
     });
 
+    it("setBusinessTarget: removing and re-adding a target does NOT resurrect its previously-approved selectors (SSA-10)", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const target = ctx.stranger.account.address;
+
+      await ownerWrite(ctx, "setBusinessTarget", [target, true]);
+      await ownerWrite(ctx, "setTargetSelector", [target, SEL_ALLOWED, true]);
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SEL_ALLOWED]),
+        true,
+        "sanity: selector approved while target is active",
+      );
+
+      await ownerWrite(ctx, "setBusinessTarget", [target, false]);
+      await ownerWrite(ctx, "setBusinessTarget", [target, true]);
+
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SEL_ALLOWED]),
+        false,
+        "previously-approved selector must NOT be resurrected by removing and re-adding the target",
+      );
+    });
+
+    it("SSA-10 regression: a selector approved WITHIN the current generation stays approved across unrelated setBusinessTarget/setTargetSelector churn", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const target = ctx.stranger.account.address;
+      const otherTarget = ctx.factory.address;
+
+      await ownerWrite(ctx, "setBusinessTarget", [target, true]);
+      await ownerWrite(ctx, "setTargetSelector", [target, SEL_ALLOWED, true]);
+      // Idempotent re-activation of the SAME target must not wipe its selector set.
+      await ownerWrite(ctx, "setBusinessTarget", [target, true]);
+      // Activity on a DIFFERENT target must not cross-invalidate this one.
+      await ownerWrite(ctx, "setBusinessTarget", [otherTarget, true]);
+      await ownerWrite(ctx, "setBusinessTarget", [otherTarget, false]);
+      // Adding a second selector on the same generation must not disturb the first.
+      await ownerWrite(ctx, "setTargetSelector", [target, SETTLE_SELECTOR, true]);
+
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SEL_ALLOWED]),
+        true,
+        "selector approved this generation must remain approved",
+      );
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SETTLE_SELECTOR]),
+        true,
+      );
+    });
+
+    it("SSA-10 regression: explicit setTargetSelector(target, sel, false) still revokes a single selector without removing the target", async function () {
+      const ctx = await loadFixture(deployFixture);
+      const target = ctx.stranger.account.address;
+
+      await ownerWrite(ctx, "setBusinessTarget", [target, true]);
+      await ownerWrite(ctx, "setTargetSelectors", [target, [SEL_ALLOWED, SETTLE_SELECTOR], true]);
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SEL_ALLOWED]),
+        true,
+      );
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SETTLE_SELECTOR]),
+        true,
+      );
+
+      await ownerWrite(ctx, "setTargetSelector", [target, SEL_ALLOWED, false]);
+
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SEL_ALLOWED]),
+        false,
+        "explicitly revoked selector must be false",
+      );
+      assert.strictEqual(
+        await ctx.paymaster.read.targetSelectorAllowlist([target, SETTLE_SELECTOR]),
+        true,
+        "the OTHER selector on the same target, same generation, must be unaffected",
+      );
+      // target itself is still active
+      assert.strictEqual(await ctx.paymaster.read.businessAllowlist([target]), true);
+    });
+
     it("allowlisted (target, selector) is sponsored; a DIFFERENT selector on the SAME target soft-declines (AA34)", async function () {
       const ctx = await loadFixture(deployFixture);
       await setupHappyPath(ctx, ctx.walletAAddr, { dailyCap: parseEther("1") }); // business path

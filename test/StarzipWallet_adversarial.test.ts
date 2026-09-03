@@ -394,7 +394,7 @@ describe("StarzipWallet — adversarial review", function () {
       await assert.rejects(submitWithRawSignature(ctx, raw), /AA24/);
     });
 
-    it("ACCEPTS trailing garbage bytes appended after a well-formed signatureData slice (corrected NatSpec claim: this is NOT rejected)", async function () {
+    it("REJECTS trailing garbage bytes appended after a well-formed signatureData slice (SSA-02)", async function () {
       const ctx = await loadFixture(deployFixture);
       const callData = encodeFunctionData({
         abi: ctx.account.abi,
@@ -405,19 +405,15 @@ describe("StarzipWallet — adversarial review", function () {
       const userOp = buildUserOp(ctx.walletAddr, nonce, callData);
       const userOpHash = (await ctx.entryPoint.read.getUserOpHash([userOp])) as Hex;
       const good = encodeSignatureWrapper(0n, webauthnSignature(userOpHash, PASSKEY_PRIV));
-      // Append 64 bytes of garbage AFTER the declared signatureData — never read by the decoder,
-      // per its own (corrected) NatSpec.
+      // Append 64 bytes of garbage AFTER the declared signatureData. SSA-02:
+      // `_decodeSignatureWrapper` requires an exact total length, so this must decline (AA24).
       userOp.signature = concatHex([good, ("0x" + "ff".repeat(64)) as Hex]);
-      const hash = await ctx.entryPoint.write.handleOps(
-        [[userOp], ctx.beneficiary.account.address],
-        {
+      await assert.rejects(
+        ctx.entryPoint.write.handleOps([[userOp], ctx.beneficiary.account.address], {
           account: ctx.deployer.account,
-        },
-      );
-      const receipt = await ctx.publicClient.waitForTransactionReceipt({ hash });
-      assert.ok(
-        opSucceeded(receipt, ctx.entryPoint.abi),
-        "trailing bytes after signatureData must be silently ignored, not rejected",
+        }),
+        /AA24/,
+        "trailing bytes after signatureData must be rejected, not silently ignored",
       );
     });
   });
@@ -993,39 +989,26 @@ describe("StarzipWallet — adversarial review", function () {
       );
     });
 
-    it("KNOWN GAP (extends GAP-1 to the whole family): getAddress predicts a fundable address for EVERY owner set createAccount rejects", async function () {
+    it("SSA-16: getAddress rejects every owner set createAccount rejects, with the same named error", async function () {
       const ctx = await loadFixture(deployFixture);
-      // test/StarzipWallet_issueToken_e2e.test.ts's "GAP-1" already pins this for ONE input
-      // (owner == address(0)). It is not a one-off: `getAddress` runs NO owner-set validation at
-      // all, so the same silence covers the whole rejected family below — including
-      // `[A, A]`, the only member a correct-looking client can hit by accident (re-registering an
+      // test/StarzipWallet_issueToken_e2e.test.ts's "GAP-1" pins this for ONE input
+      // (owner == address(0)); this pins it for the whole rejected family — including `[A, A]`,
+      // the only member a correct-looking client can hit by accident (re-registering an
       // authenticator the user already registered).
       //
-      // Why it costs money rather than just being untidy: this is a counterfactual-address
-      // wallet. The address is handed to the user and FUNDED BEFORE any deployment. The owner set
-      // is baked into the CREATE2 initcode hash, so an address predicted from a rejected owner set
-      // has exactly one possible initcode and that initcode always reverts — the address can never
-      // be deployed with a corrected owner set, and anything sent there is unrecoverable.
-      //
-      // THIS TEST DELIBERATELY ASSERTS THE CURRENT (permissive) BEHAVIOUR. If validation is ever
-      // added to `getAddress` — or a `validateOwners()` view is added and made mandatory for
-      // clients — INVERT this test rather than deleting it. Measured cost of adding the validation
-      // directly to `getAddress`, for whoever makes that call: it breaks exactly two existing
-      // tests, both of which feed it deliberately-invalid input
-      // (StarzipWalletFactory.test.ts's differing-second-owner case passes `[first, first]`, and
-      // GAP-1 itself passes `owner == address(0)`).
+      // SSA-16: `getAddress` runs the same shape/value validation `_registerOwner` applies
+      // (`StarzipWallet.validateOwnerBytes`) plus an in-array duplicate check, before computing
+      // the CREATE2 address, so it reverts with the same named error `createAccount` would.
       for (const row of UNDEPLOYABLE) {
-        const predicted = (await ctx.factory.read.getAddress([row.owners, 4242n])) as Address;
-        assert.match(predicted, /^0x[0-9a-fA-F]{40}$/, `${row.label} still predicts an address`);
-        assert.strictEqual(
-          await ctx.publicClient.getCode({ address: predicted }),
-          undefined,
-          `${row.label}: nothing is deployed there, and nothing ever can be`,
+        await assert.rejects(
+          ctx.factory.read.getAddress([row.owners, 4242n]) as Promise<Address>,
+          new RegExp(row.error),
+          `${row.label}: getAddress must reject this, not predict a fundable address for it`,
         );
         await assert.rejects(
           ctx.factory.write.createAccount([row.owners, 4242n], { account: ctx.deployer.account }),
           new RegExp(row.error),
-          `${row.label}: the address getAddress just returned is permanently undeployable`,
+          `${row.label}: createAccount must reject this too, with the same error`,
         );
       }
     });

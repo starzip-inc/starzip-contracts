@@ -478,19 +478,19 @@ describe("StarzipWallet — only the ERC-7739 TypedDataSign workflow is accepted
   });
 
   // --------------------------------------------------------------
-  // 4. _verifyPasskey and trailing-garbage-padded assertions — round 2 added a length check here
-  //    that rejected these; round 3 REMOVED it (critic mutation-matrix finding: it contributed
-  //    nothing to blocking PROBE A — the isValidSignature reimplementation alone already blocks it
-  //    cryptographically — while costing +654 gas per ERC-1271 verification and adding a reject
-  //    surface to the ERC-4337 money path against round-1's own "don't touch it" instruction). These
-  //    tests now pin the CURRENT (post-removal) behavior: a genuine signature padded with trailing
-  //    garbage still validates, because WebAuthn's own decode tolerates it and the underlying
-  //    signature is real — padding a genuine signature grants an attacker no new forgery capability,
-  //    since they needed that genuine signature over the exact digest already. This is intentional,
-  //    not a regression; see _verifyPasskey's NatSpec "HISTORY" note for the full record.
+  // 4. Trailing-garbage padding sits at two layers, and they behave differently:
+  //
+  //      (a) OUTER — garbage appended after the whole `abi.encode(SignatureWrapper(...))` blob.
+  //          REJECTED as of SSA-02: `_decodeSignatureWrapper` requires exact length (up to ABI
+  //          zero-padding).
+  //
+  //      (b) INNER — garbage inside the WebAuthn assertion bytes (`SignatureWrapper.signatureData`),
+  //          added BEFORE the outer wrapper is built, so the wrapper's declared length is still
+  //          self-consistent and SSA-02's check has nothing to reject. Still accepted; see
+  //          `_verifyPasskeyOwner`'s NatSpec "HISTORY" note.
   // --------------------------------------------------------------
-  describe("_verifyPasskey: trailing-garbage padding is harmless (length check removed round 3)", function () {
-    it("a genuine TypedDataSign envelope whose inner assertion has appended garbage still validates", async function () {
+  describe("SSA-02: outer SignatureWrapper trailing-garbage padding is rejected", function () {
+    it("rejects a TypedDataSign envelope whose OUTER inner-signature blob has appended garbage", async function () {
       const f = await loadFixture(settlementFixture);
       const {
         account,
@@ -548,13 +548,13 @@ describe("StarzipWallet — only the ERC-7739 TypedDataSign workflow is accepted
 
       assert.strictEqual(
         await account.read.isValidSignature([orderDigest, taintedSig]),
-        ERC1271_MAGIC,
-        "padding a GENUINE inner signature is harmless — the underlying assertion is still real, " +
-          "still challenge-bound to the correct digest, and grants no new forgery capability",
+        ERC1271_INVALID,
+        "SSA-02: the OUTER `abi.encode(SignatureWrapper(...))` blob must decode to EXACTLY its " +
+          "declared length (mod 32-byte ABI padding)",
       );
     });
 
-    it("a userOp whose genuine passkey signature has appended garbage still validates (4337 path, matches HEAD)", async function () {
+    it("accepts a userOp whose passkey signature has appended garbage INSIDE the WebAuthn assertion (4337 path, INNER padding — see note (b))", async function () {
       const { entryPoint, account, walletAddr, deployer, beneficiary, publicClient } =
         await loadFixture(walletFixture);
       const callData = encodeFunctionData({
@@ -573,9 +573,9 @@ describe("StarzipWallet — only the ERC-7739 TypedDataSign workflow is accepted
         0n,
         concatHex([goodSig, "0xdeadbeefdeadbeef"]) as Hex,
       );
-      // Does NOT reject — matches HEAD (pre-) behavior exactly, restored by removing round 2's
-      // length check. userOpHash is already EntryPoint-domain-bound; padding an otherwise-genuine
-      // signature is cosmetic, not a forgery vector.
+      // Does NOT reject: the outer wrapper is built AFTER the garbage is already inside
+      // `signatureData`, so its declared length is self-consistent and SSA-02's exact-length check
+      // has nothing to reject. See note (b) above.
       const hash = await entryPoint.write.handleOps([[userOp], beneficiary.account.address], {
         account: deployer.account,
       });

@@ -20,4 +20,9 @@ contract RevertingPaymasterStub {
     function revokeSponsorshipOnUpgrade() external pure {
         revert AlwaysReverts();
     }
+
+    // F7: StarzipWallet's constructor staticcalls this selector to validate canonicalPaymaster.
+    function getPolicy(address) external pure returns (bytes32) {
+        return bytes32(0);
+    }
 }

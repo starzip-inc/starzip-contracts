@@ -14,6 +14,7 @@ import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/Mes
 import { IERC1271 } from "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
+import { TransientSlot } from "@openzeppelin/contracts/utils/TransientSlot.sol";
 import { ERC721Holder } from "@openzeppelin/contracts/token/ERC721/utils/ERC721Holder.sol";
 import { ERC1155Holder } from "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 
@@ -70,6 +71,7 @@ contract StarzipWallet is
     IAccount
 {
     using MessageHashUtils for bytes32;
+    using TransientSlot for *;
 
     // ============ Constants ============
     uint256 private constant SIG_VALIDATION_SUCCESS = 0;
@@ -119,6 +121,13 @@ contract StarzipWallet is
     ///      actually allows. Re-verify this direction of reasoning if either constant's role
     ///      changes.
     uint256 private constant MAX_BATCH_SIZE = 32;
+
+    /// @dev SSA-18. Transient (EIP-1153) slot holding the `ownerEpoch` snapshot written by
+    ///      {validateUserOp} and read back by {execute}/{executeBatch}.
+    ///      Derivation: keccak256(abi.encode(uint256(keccak256(
+    ///      "starzip.storage.OwnerEpochTransient")) - 1)) & ~bytes32(uint256(0xff))
+    bytes32 private constant OWNER_EPOCH_TRANSIENT_SLOT =
+        0x1c708d6a2235931ecdd730b9de8671d2372ae56907556563604a6ea08f1a4e00;
 
     /// @dev EIP-712 domain of the WALLET ITSELF, used only by the ERC-7739 defensive rehashing
     ///      (see {_rawSignatureValidation}). Returned as constants via the {_EIP712Name} /
@@ -192,17 +201,20 @@ contract StarzipWallet is
 
     bool public hasBeenUpgraded;
 
+    /// @dev SSA-18. Bumped by {_cancelPendingUpgradeOnOwnerChange} on every owner-set mutation.
+    uint256 public ownerEpoch;
+
     // ============ Storage Gap ============
     // Full redesign — this contract has never had a real mainnet deployment (the AA factory has
     // deployed exactly one opBNB-testnet wallet, an empty test account with an immutable
     // `accountImplementation`, so onboarding a new design means a new factory and new
     // counterfactual addresses regardless — see the deploy notes accompanying this change), so
     // storage is free to be laid out cleanly rather than threaded around a legacy slot numbering.
-    // 44 reserved slots leaves headroom comparable to this codebase's other UUPS contracts
+    // 43 reserved slots leaves headroom comparable to this codebase's other UUPS contracts
     // (e.g. `ERC20V1`'s `uint256[50] __gap`) for whatever this wallet's owner-set model grows next
     // (per-owner metadata, a session-key allowance table, etc.) without ever touching the slots
     // above.
-    uint256[43] private __gap;
+    uint256[42] private __gap;
 
     // ============ Events ============
     event Executed(address indexed target, uint256 value, bytes data);
@@ -212,6 +224,9 @@ contract StarzipWallet is
     event UpgradeRequested(address indexed newImplementation, uint256 readyAt);
     event UpgradeCancelled(address indexed cancelledImplementation);
     event PaymasterUpgradeNotification(address indexed paymaster, bool success);
+    /// @dev SSA-01. Signal only — there is no on-chain restore path; a backend decides whether to
+    ///      call `VerifyingPaymaster.setSponsored(wallet, true)` (`onlyPolicyManager`).
+    event SponsorshipRestoreRequested(address indexed wallet);
 
     // ============ Errors ============
     error OnlyEntryPoint();
@@ -231,6 +246,12 @@ contract StarzipWallet is
     error NotPendingImplementation();
     error InvalidImplementation();
     error ExecutionFailed(uint256 index);
+    /// @dev SSA-18
+    error OwnerSetChanged();
+    /// @dev SSA-01
+    error RevokeSponsorshipFailed();
+    /// @dev F7
+    error InvalidPaymaster();
 
     // ============ Modifiers ============
     modifier onlyEntryPoint() {
@@ -265,9 +286,23 @@ contract StarzipWallet is
         _;
     }
 
+    /// @dev F7: `address(0)` is allowed (no-paymaster deployment; `requestUpgrade` already skips
+    ///      the notify call in that case). A non-zero address must have code and answer
+    ///      `getPolicy(address)` — a genuine `VerifyingPaymaster` view, never the state-changing
+    ///      `revokeSponsorshipOnUpgrade()` itself (staticcall-safe only by accident of its current
+    ///      early-return-when-unsponsored implementation, which this check must not depend on) —
+    ///      so an EOA, a codeless address, or a contract missing this interface can never be wired
+    ///      in and permanently brick every future `requestUpgrade` on wallets naming it.
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor(IEntryPoint _entryPoint, address _canonicalPaymaster) {
         entryPoint = _entryPoint;
+        if (_canonicalPaymaster != address(0)) {
+            if (_canonicalPaymaster.code.length == 0) revert InvalidPaymaster();
+            (bool ok, bytes memory ret) = _canonicalPaymaster.staticcall(
+                abi.encodeWithSignature("getPolicy(address)", address(0))
+            );
+            if (!ok || ret.length == 0) revert InvalidPaymaster();
+        }
         canonicalPaymaster = _canonicalPaymaster;
         _disableInitializers();
     }
@@ -309,6 +344,9 @@ contract StarzipWallet is
         uint256 missingAccountFunds
     ) external onlyEntryPoint returns (uint256 validationData) {
         validationData = _validateSignature(userOp, userOpHash);
+
+        // SSA-18
+        OWNER_EPOCH_TRANSIENT_SLOT.asUint256().tstore(ownerEpoch);
 
         if (missingAccountFunds > 0) {
             (bool success, ) = payable(msg.sender).call{ value: missingAccountFunds }("");
@@ -356,6 +394,7 @@ contract StarzipWallet is
      *      (documentation-only).
      */
     function execute(address dest, uint256 value, bytes calldata func) external onlyEntryPoint nonReentrant {
+        _requireUnchangedOwnerEpoch();
         (bool success, bytes memory result) = dest.call{ value: value }(func);
         if (!success) {
             assembly {
@@ -388,6 +427,7 @@ contract StarzipWallet is
         uint256[] calldata values,
         bytes[] calldata funcs
     ) external onlyEntryPoint nonReentrant {
+        _requireUnchangedOwnerEpoch();
         if (dest.length == 0 || dest.length != values.length || dest.length != funcs.length)
             revert InvalidArrayLength();
         if (dest.length > MAX_BATCH_SIZE) revert BatchTooLarge();
@@ -407,6 +447,11 @@ contract StarzipWallet is
             }
         }
         emit BatchExecuted(dest.length);
+    }
+
+    /// @dev SSA-18
+    function _requireUnchangedOwnerEpoch() private view {
+        if (OWNER_EPOCH_TRANSIENT_SLOT.asUint256().tload() != ownerEpoch) revert OwnerSetChanged();
     }
 
     // ============ Admin: Owner Set (Coinbase-Smart-Wallet-style multi-owner) ============
@@ -560,8 +605,12 @@ contract StarzipWallet is
      *      returning `SIG_VALIDATION_FAILED` — the write path's incidental decode is the only thing
      *      keeping the read path's decode total. This falsifies any blanket claim that every
      *      rejection in this contract carries its own named error; this one does not.
+     *
+     *      SSA-16: split out of {_registerOwner} as `public pure` (storage-independent) so
+     *      `StarzipWalletFactory.getAddress` can staticcall it on `accountImplementation` and
+     *      share one copy of these checks.
      */
-    function _registerOwner(bytes memory ownerBytes) internal {
+    function validateOwnerBytes(bytes memory ownerBytes) public pure {
         if (ownerBytes.length == 32) {
             if (abi.decode(ownerBytes, (address)) == address(0)) revert ZeroAddress();
         } else if (ownerBytes.length == 64) {
@@ -570,6 +619,10 @@ contract StarzipWallet is
         } else {
             revert InvalidOwnerBytesLength();
         }
+    }
+
+    function _registerOwner(bytes memory ownerBytes) internal {
+        validateOwnerBytes(ownerBytes);
         if (isOwnerBytes[ownerBytes]) revert AlreadyOwner();
 
         uint256 index = nextOwnerIndex;
@@ -606,24 +659,46 @@ contract StarzipWallet is
             emit UpgradeCancelled(pendingImplementation);
             pendingImplementation = address(0);
             upgradeRequestedAt = 0;
+            emit SponsorshipRestoreRequested(address(this)); // SSA-01
+        }
+        // SSA-18: outside the `if` — every owner-set mutation must invalidate same-bundle ops.
+        unchecked {
+            ++ownerEpoch;
         }
     }
 
     // ============ Admin: Upgrade Timelock (owner self-call + timelock) ============
+    /**
+     * @dev SSA-01: sponsorship is revoked at STAGING time, and fail-closed — a non-zero
+     *      `trustedPaymaster()` whose `revokeSponsorshipOnUpgrade()` call fails reverts the whole
+     *      staging op. A zero `trustedPaymaster()` stays a silent no-op: {_requireTrustedPaymaster}
+     *      can never have granted sponsorship to a wallet whose `trustedPaymaster()` is zero, so
+     *      there is nothing to revoke.
+     */
     function requestUpgrade(address newImplementation) external onlySelf {
         if (newImplementation == address(0)) revert ZeroAddress();
         if (newImplementation.code.length == 0) revert InvalidImplementation();
         pendingImplementation = newImplementation;
         upgradeRequestedAt = block.timestamp;
         emit UpgradeRequested(newImplementation, block.timestamp + UPGRADE_TIMELOCK);
+
+        address paymasterToNotify = trustedPaymaster();
+        if (paymasterToNotify != address(0)) {
+            (bool ok, ) = paymasterToNotify.call(abi.encodeWithSignature("revokeSponsorshipOnUpgrade()"));
+            emit PaymasterUpgradeNotification(paymasterToNotify, ok);
+            if (!ok) revert RevokeSponsorshipFailed();
+        }
     }
 
+    /// @dev SSA-01: does not restore the sponsorship {requestUpgrade} revoked; see
+    ///      {SponsorshipRestoreRequested}.
     function cancelUpgrade() external onlySelf {
         if (pendingImplementation == address(0)) revert NoUpgradePending();
         address cancelled = pendingImplementation;
         pendingImplementation = address(0);
         upgradeRequestedAt = 0;
         emit UpgradeCancelled(cancelled);
+        emit SponsorshipRestoreRequested(address(this));
     }
 
     function trustedPaymaster() public view returns (address) {
@@ -895,23 +970,22 @@ contract StarzipWallet is
      *        [96:128)  = signatureData.length
      *        [128:...) = signatureData bytes
      *      Both constant offset words are checked, so this function never accepts an
-     *      equivalent-but-differently-offset ABI blob. NOTE: this does NOT mean the ONE
-     *      canonical encoding is the only thing accepted
-     *      — verified by direct execution, trailing bytes appended AFTER byte
-     *      `128 + signatureData.length` are silently ignored (never read, never included in
-     *      `signatureData`) and the input still validates normally. This function only pins the
-     *      HEAD layout and the declared `signatureData` slice; it does not assert that
-     *      `signature.length == 128 + signatureData.length` exactly. Harmless on its own — see
-     *      {isValidSignature}'s NatSpec for why an accepted-with-trailing-garbage buffer cannot
-     *      be turned into a cross-context replay by itself — but recorded here so a future reader
-     *      does not rely on "canonical-only" as an invariant this function actually enforces.
+     *      equivalent-but-differently-offset ABI blob.
+     *
+     *      SSA-02: the total buffer length must also be EXACTLY `128 + signatureData.length`
+     *      rounded up to the next 32-byte boundary, with all bytes in that rounding gap zero, so
+     *      no trailing bytes can be appended and later stripped. This bounds tolerated slack to at
+     *      most 31 zero bytes; {VerifyingPaymaster}'s `minSigLen` floor is what actually binds
+     *      `preVerificationGas` to the real submission.
      *
      *      Declines (returns `ok = false`) rather than reverting for any input too short to
-     *      possibly be well-formed, or whose declared `signatureData` length would run past the
-     *      buffer — this is required so the caller (validateUserOp's dispatch,
-     *      {_verifyOwnerSignature}) can return `SIG_VALIDATION_FAILED` / `0xffffffff` instead of
-     *      reverting, matching this wallet's existing "malformed input is a failed verification,
-     *      not an exception" posture (see {_verifyPasskey}'s own such note, inherited unchanged).
+     *      possibly be well-formed, whose declared `signatureData` length would run past the
+     *      buffer, whose total length does not match the exact bound above, or whose padding bytes
+     *      in that rounding gap are not all zero — this is required so the caller
+     *      (validateUserOp's dispatch, {_verifyOwnerSignature}) can return `SIG_VALIDATION_FAILED`
+     *      / `0xffffffff` instead of reverting, matching this wallet's existing "malformed input
+     *      is a failed verification, not an exception" posture (see {_verifyPasskey}'s own such
+     *      note, inherited unchanged).
      */
     function _decodeSignatureWrapper(
         bytes calldata signature
@@ -928,8 +1002,20 @@ contract StarzipWallet is
         // `FailedOpWithRevert(0, "AA23 reverted", Panic 0x11)`, which validateUserOp must NEVER
         // do (see this function's own "declines rather than reverting" NatSpec above). Rewritten
         // as a subtraction, which cannot itself overflow/underflow: `signature.length >= 128` is
-        // already established by the length check at the top of this function.
+        // already established by the length check at the top of this function. This bound also
+        // makes `len` safe to add to below (nowhere near `type(uint256).max` once this passes).
         if (len > signature.length - 128) return (false, 0, signature[0:0]);
+        // SSA-02: ABI encoding zero-pads a dynamic `bytes` up to the next 32-byte boundary, so a
+        // canonical wrapper is `128 + roundUp32(len)` bytes — e.g. `128 + 96` for a raw 65-byte
+        // ECDSA signature. A literal `128 + len` bound would reject every ECDSA-owner signature.
+        uint256 paddedLen = (len + 31) & ~uint256(31);
+        if (signature.length != 128 + paddedLen) return (false, 0, signature[0:0]);
+        for (uint256 i = 128 + len; i < signature.length; ) {
+            if (signature[i] != 0) return (false, 0, signature[0:0]);
+            unchecked {
+                ++i;
+            }
+        }
         signatureData = signature[128:128 + len];
         ok = true;
     }
@@ -1066,6 +1152,7 @@ contract StarzipWallet is
         pendingImplementation = address(0);
         upgradeRequestedAt = 0;
         hasBeenUpgraded = true;
+        // SSA-01: idempotent fallback; the primary revoke happens at staging in {requestUpgrade}.
         address paymasterToNotify = trustedPaymaster();
         if (paymasterToNotify != address(0)) {
             (bool ok, ) = paymasterToNotify.call(

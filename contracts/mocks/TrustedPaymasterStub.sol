@@ -20,11 +20,23 @@ pragma solidity 0.8.30;
  *      `hardhat_setCode` — the JSON-RPC equivalent of Foundry's `vm.etch`, used the same way in
  *      `test/PaymasterInvariants.t.sol`) without reintroducing the removed carve-out on the
  *      production contract itself.
+ *
+ *      SSA-01: `_requireTrustedPaymaster` also staticcalls
+ *      `pendingImplementation()`/`hasBeenUpgraded()` and fails closed if either call fails, so both
+ *      are answered here as "no upgrade ever staged or executed".
  */
 contract TrustedPaymasterStub {
     address public immutable trustedPaymaster;
 
     constructor(address _trustedPaymaster) {
         trustedPaymaster = _trustedPaymaster;
+    }
+
+    function pendingImplementation() external pure returns (address) {
+        return address(0);
+    }
+
+    function hasBeenUpgraded() external pure returns (bool) {
+        return false;
     }
 }

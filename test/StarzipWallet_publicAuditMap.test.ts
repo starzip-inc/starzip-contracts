@@ -943,12 +943,14 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
       const entryPoint = await viem.deployContract("TestEntryPoint", []);
       const factory = await viem.deployContract("StarzipWalletFactory", [entryPoint.address, zeroAddress]);
 
-      // Capped at 56 owners per wallet. MEASURED, not assumed: `createAccount` costs ~74k gas per
-      // owner (n=4 => 475,835 ... n=64 => 4,944,246), and Hardhat's EDR block gas cap here is
-      // 16,777,216, which the provider compares against a MULTIPLIED estimate — empirically n=64
-      // still goes through and n=96 is rejected outright ("transaction gas limit (18606132) is
-      // greater than the cap (16777216)") before executing. 56 keeps a comfortable margin. A 7x
-      // span over four points is ample to establish linearity, which is the claim here.
+      // Capped at 56 owners per wallet. MEASURED, not assumed: `createAccount` costs ~107k
+      // gas/owner (n=8 => 818,805 ... n=64 => 7,380,145), under Hardhat's EDR block gas cap of
+      // 16,777,216.
+      //
+      // The explicit `gas` override below is needed because EDR's automatic `eth_estimateGas`
+      // inflates past the cap for this deployment — it demanded 18,096,719 for n=56 despite the
+      // transaction only using 6,193,438 once sent with an explicit limit. That is a deployment
+      // artifact, not a property of `getOwners()` (what this test actually measures).
       const COUNTS = [8, 24, 40, 56];
       const measurements: { n: number; gas: bigint }[] = [];
       for (const n of COUNTS) {
@@ -959,7 +961,7 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
           );
         }
         const salt = BigInt(900000 + n);
-        await factory.write.createAccount([owners, salt], { account: deployer.account });
+        await factory.write.createAccount([owners, salt], { account: deployer.account, gas: 16_000_000n });
         const addr = (await factory.read.getAddress([owners, salt])) as Address;
         const w = await viem.getContractAt("StarzipWallet", addr);
         assert.strictEqual((await w.read.ownerCount()) as bigint, BigInt(n));
@@ -1585,33 +1587,32 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
 
   // ==========================================================================================
   // Certora M-1 — `createAccount` WITH AN EMPTY OWNERS ARRAY CREATES A FRONTRUNNABLE /
-  // STEALABLE UNINITIALIZED ACCOUNT. Bucket: (b) CLOSED.
+  // STEALABLE UNINITIALIZED ACCOUNT. Bucket: (b) CLOSED, strengthened by SSA-16.
   //
   // Upstream's factory would deploy an account with no owners; anyone could then claim it. Our
   // guard is `if (owners.length == 0) revert InvalidArrayLength();` at StarzipWallet.sol:238 —
   // note it lives in `initialize`, not in the factory (StarzipWalletFactory.sol's NatSpec says so
   // explicitly), so the revert happens DURING proxy construction and nothing is left behind.
+  //
+  // SSA-16: `getAddress` now runs the same `owners.length == 0` check `initialize` does, before
+  // computing any CREATE2 address, so an empty owner set never yields a fundable,
+  // never-deployable phantom address to check for stray code at.
   // ==========================================================================================
   describe("Certora M-1: empty owner set at creation", function () {
-    it("Certora M-1: createAccount([], salt) reverts and deploys NOTHING", async function () {
-      const { factory, deployer, publicClient } = await loadFixture(deployFixture);
+    it("Certora M-1 / SSA-16: createAccount([], salt) reverts, and getAddress([], salt) refuses to predict an address at all", async function () {
+      const { factory, deployer } = await loadFixture(deployFixture);
       const salt = 991n;
 
-      const predicted = (await factory.read.getAddress([[], salt])) as Address;
-      assert.match(predicted, /^0x[0-9a-fA-F]{40}$/);
-      assert.ok(isEmptyCode(await publicClient.getCode({ address: predicted })), "empty before");
+      await assert.rejects(
+        factory.read.getAddress([[], salt]) as Promise<Address>,
+        /InvalidArrayLength/,
+        "getAddress must refuse to predict an address for an empty owner set",
+      );
 
       await assert.rejects(
         factory.write.createAccount([[], salt], { account: deployer.account }),
         /InvalidArrayLength/,
-        "an empty owner set must be refused",
-      );
-
-      // The half that actually matters: the revert happens inside the proxy CONSTRUCTOR, so there
-      // is no half-deployed, ownerless proxy sitting at the predicted address for someone to claim.
-      assert.ok(
-        isEmptyCode(await publicClient.getCode({ address: predicted })),
-        "nothing may be deployed at the predicted address after the failed createAccount",
+        "an empty owner set must be refused with the same named error getAddress used",
       );
     });
 
@@ -1641,30 +1642,38 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
     //   (bricked), not STEALABLE, because we have no unauthenticated `initialize`-style claim path.
     //   The loss is still total for anyone who funded the counterfactual address.
     // RESTORED: yes; recompiled; re-run GREEN.
+    //
+    // SSA-16: `createAccount` now hits `getAddress`'s own `owners.length == 0` guard first, so
+    // probing through the factory no longer isolates `initialize`'s guard. This deploys a raw
+    // `ERC1967Proxy` against `factory.accountImplementation()` instead — the same mechanism
+    // `createAccount` uses internally, and a real attack surface since
+    // `accountImplementation()` is public.
     // ------------------------------------------------------------------------------------------
-    it("Certora M-1: the empty-owner-set guard is load-bearing", async function () {
+    it("Certora M-1 / SSA-16: the initialize()-level empty-owner-set guard is load-bearing for a direct ERC1967Proxy deployment", async function () {
       const ctx = await loadFixture(deployFixture);
       const { factory, deployer, publicClient, viem, entryPoint, beneficiary, chainId } = ctx;
-      const salt = 992n;
-      const predicted = (await factory.read.getAddress([[], salt])) as Address;
+      const implAddr = (await factory.read.accountImplementation()) as Address;
+      const impl = await viem.getContractAt("StarzipWallet", implAddr);
+      const initData = encodeFunctionData({ abi: impl.abi, functionName: "initialize", args: [[]] });
 
       let deployedAnyway = false;
+      let proxyAddr: Address | undefined;
       try {
-        const h = await factory.write.createAccount([[], salt], { account: deployer.account });
-        await publicClient.waitForTransactionReceipt({ hash: h });
+        const proxy = await viem.deployContract("ERC1967Proxy", [implAddr, initData]);
+        proxyAddr = proxy.address;
         deployedAnyway = true;
       } catch {
-        /* expected on clean code */
+        /* expected on clean code: InvalidArrayLength() inside initialize(), during construction */
       }
 
-      if (deployedAnyway) {
+      if (deployedAnyway && proxyAddr) {
         // GUARD REMOVED. Measure the resulting account and put the evidence in the failure.
-        const w = await viem.getContractAt("StarzipWallet", predicted);
-        const code = await publicClient.getCode({ address: predicted });
+        const w = await viem.getContractAt("StarzipWallet", proxyAddr);
+        const code = await publicClient.getCode({ address: proxyAddr });
         const ownerCount = (await w.read.ownerCount()) as bigint;
         const nextIdx = (await w.read.nextOwnerIndex()) as bigint;
 
-        const probeCtx = { ...ctx, account: w, walletAddr: predicted, chainId };
+        const probeCtx = { ...ctx, account: w, walletAddr: proxyAddr, chainId };
         const { digest, sig } = buildErc1271Payload(
           probeCtx,
           (d) => encodeSignatureWrapper(0n, webauthnSignature(d, PASSKEY_PRIV)),
@@ -1672,7 +1681,7 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
             name: WALLET_EIP712_NAME,
             version: WALLET_EIP712_VERSION,
             chainId,
-            verifyingContract: predicted,
+            verifyingContract: proxyAddr,
           },
         );
         let erc1271: string;
@@ -1682,7 +1691,7 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
           erc1271 = `REVERTED(${failureText(e).slice(0, 100)})`;
         }
 
-        await deployer.sendTransaction({ to: predicted, value: parseEther("1") });
+        await deployer.sendTransaction({ to: proxyAddr, value: parseEther("1") });
         let userOpOutcome = "ACCEPTED (!!)";
         try {
           await sendOp({ ...probeCtx, entryPoint, deployer, beneficiary, publicClient }, (h2) =>
@@ -1700,19 +1709,21 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
         }
 
         assert.fail(
-          `Certora M-1 GUARD REMOVED: createAccount([], salt) DEPLOYED a wallet at ${predicted} ` +
-            `(code length ${code ? (code.length - 2) / 2 : 0} bytes) with ownerCount=${ownerCount}, ` +
-            `nextOwnerIndex=${nextIdx}. ERC-1271 returns ${erc1271}; a userOp naming owner 0 fails with ` +
-            `${userOpOutcome}; addOwnerAddress from an EOA fails with ${adminOutcome}. ` +
-            `The account is permanently bricked AND fundable — no owner can ever be added because every ` +
-            `add path is onlySelf and onlySelf requires an owner signature that cannot exist.`,
+          `Certora M-1 GUARD REMOVED: a direct ERC1967Proxy deployment against accountImplementation() ` +
+            `DEPLOYED a wallet at ${proxyAddr} (code length ${code ? (code.length - 2) / 2 : 0} bytes) ` +
+            `with ownerCount=${ownerCount}, nextOwnerIndex=${nextIdx}. ERC-1271 returns ${erc1271}; a ` +
+            `userOp naming owner 0 fails with ${userOpOutcome}; addOwnerAddress from an EOA fails with ` +
+            `${adminOutcome}. The account is permanently bricked AND fundable — no owner can ever be ` +
+            `added because every add path is onlySelf and onlySelf requires an owner signature that ` +
+            `cannot exist.`,
         );
       }
 
       // Clean behaviour: refused, and nothing deployed.
       assert.ok(
-        isEmptyCode(await publicClient.getCode({ address: predicted })),
-        "the guard must prevent any deployment at the empty-owner-set address",
+        !deployedAnyway,
+        "the initialize()-level guard must prevent deployment of an ownerless account via a direct " +
+          "ERC1967Proxy, independent of getAddress's own SSA-16 guard",
       );
     });
   });
@@ -1960,11 +1971,19 @@ describe("StarzipWallet — public-audit map (coinbase/smart-wallet findings)", 
         );
       }
 
-      // Clean behaviour: nothing was registered, and the address stays undeployable.
-      const predicted = (await factory.read.getAddress([[DIRTY_HIGH_BITS], salt])) as Address;
-      assert.ok(
-        isEmptyCode(await publicClient.getCode({ address: predicted })),
-        "a wallet with a dirty-high-bits owner must never come into existence",
+      // Clean behaviour: nothing was registered. SSA-16: `getAddress` and `createAccount` both
+      // funnel through the shared `validateOwnerBytes` and hit the same bare ABI-decoder revert,
+      // so there is no predicted address left to check for stray code at — pin the revert instead.
+      let getAddressText = "DID NOT REVERT";
+      try {
+        await factory.read.getAddress([[DIRTY_HIGH_BITS], salt]);
+      } catch (e) {
+        getAddressText = failureText(e);
+      }
+      assert.notStrictEqual(
+        getAddressText,
+        "DID NOT REVERT",
+        "getAddress must also refuse to predict an address for a dirty-high-bits owner (SSA-16)",
       );
 
       // Positive control on the SAME machinery: an unregistered ownerIndex on a HEALTHY wallet

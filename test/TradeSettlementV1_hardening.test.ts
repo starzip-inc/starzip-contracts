@@ -1580,6 +1580,108 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
       );
     });
 
+    it("SSA-04 regression: re-registering without a prior revoke resets an omitted asset's effective cap to 0", async function () {
+      // registerSessionKey's own docs say an empty tokens/caps pair (or omitted asset) leaves
+      // that asset's cap at its default of 0. Before this fix, re-registering the SAME session
+      // key (no revokeSessionKey in between) left `sessionKeyGeneration` unchanged, so a token's
+      // stale `sessionKeyCapGeneration` still matched and its old cap kept applying.
+      const f = await loadFixture(deployFixture);
+      const { settlement, alice, usdt, expiry } = f;
+      const sessionKey = privateKeyToAccount(SESSION_KEY_PK);
+      const cap = parseUnits("100", 18);
+
+      await settlement.write.registerSessionKey(
+        [sessionKey.address, expiry, [usdt.address], [cap], [cap]],
+        { account: alice.account },
+      );
+      assert.strictEqual(
+        (await settlement.read.effectiveSessionKeySpendCap([
+          alice.account.address,
+          sessionKey.address,
+          usdt.address,
+        ])) as bigint,
+        cap,
+      );
+
+      // Re-register the same key, no revoke, omitting usdt entirely.
+      await settlement.write.registerSessionKey(
+        [sessionKey.address, expiry, [], [], []],
+        { account: alice.account },
+      );
+
+      assert.strictEqual(
+        (await settlement.read.effectiveSessionKeySpendCap([
+          alice.account.address,
+          sessionKey.address,
+          usdt.address,
+        ])) as bigint,
+        0n,
+        "omitted asset's effective spend cap must reset to 0 on re-registration, even without revoke",
+      );
+      assert.strictEqual(
+        (await settlement.read.effectiveSessionKeyOrderCap([
+          alice.account.address,
+          sessionKey.address,
+          usdt.address,
+        ])) as bigint,
+        0n,
+        "omitted asset's effective order cap must reset to 0 on re-registration, even without revoke",
+      );
+    });
+
+    it("registerSessionKeyWithSig regression: re-registering without a prior revoke resets an omitted asset's effective cap to 0", async function () {
+      const f = await loadFixture(deployFixture);
+      const { settlement, alice, usdt, expiry, chainId } = f;
+      const sessionKey = privateKeyToAccount(SESSION_KEY_PK);
+      const cap = parseUnits("100", 18);
+
+      const nonce0 = (await settlement.read.sessionKeyRegNonce([alice.account.address])) as bigint;
+      const auth1: SessionKeyAuth = {
+        account: alice.account.address,
+        sessionKey: sessionKey.address,
+        validUntil: expiry,
+        tokens: [usdt.address],
+        caps: [cap],
+        orderCaps: [cap],
+        nonce: nonce0,
+        deadline: expiry,
+      };
+      const sig1 = await signSessionKeyAuth(ALICE_KEY, auth1, chainId, settlement.address);
+      await settlement.write.registerSessionKeyWithSig([auth1, sig1], { account: alice.account });
+      assert.strictEqual(
+        (await settlement.read.effectiveSessionKeySpendCap([
+          alice.account.address,
+          sessionKey.address,
+          usdt.address,
+        ])) as bigint,
+        cap,
+      );
+
+      const nonce1 = (await settlement.read.sessionKeyRegNonce([alice.account.address])) as bigint;
+      const auth2: SessionKeyAuth = {
+        account: alice.account.address,
+        sessionKey: sessionKey.address,
+        validUntil: expiry,
+        tokens: [],
+        caps: [],
+        orderCaps: [],
+        nonce: nonce1,
+        deadline: expiry,
+      };
+      const sig2 = await signSessionKeyAuth(ALICE_KEY, auth2, chainId, settlement.address);
+      await settlement.write.registerSessionKeyWithSig([auth2, sig2], { account: alice.account });
+
+      assert.strictEqual(
+        (await settlement.read.effectiveSessionKeySpendCap([
+          alice.account.address,
+          sessionKey.address,
+          usdt.address,
+        ])) as bigint,
+        0n,
+        "omitted asset's effective spend cap must reset to 0 on relayed re-registration, even without revoke",
+      );
+    });
+
     it("registerSessionKey reverts ArrayLengthMismatch when tokens/caps arrays differ in length", async function () {
       const f = await loadFixture(deployFixture);
       const { settlement, alice, usdt, expiry } = f;

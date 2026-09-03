@@ -43,6 +43,9 @@ import { MessageHashUtils } from "@openzeppelin/contracts/utils/cryptography/Mes
  *        slot 9: maxSponsoredFeePerGas (uint128) | maxSponsoredPreVerificationGas (uint128)
  *        slot 10: selfSelectorAllowlist mapping base (entry at keccak256(selector, 10))
  *        slot 11: sponsorSigner (address, 20B)
+ *        slot 12: businessTargetGeneration mapping base (entry at keccak256(target, 12)) — SSA-10
+ *        slot 13: targetSelectorAllowlistGeneration mapping base — SSA-10
+ *                 (entry at keccak256(selector, keccak256(target, 13)))
  *
  *      ERC-7562: `_validatePaymasterUserOp` NEVER reads `block.timestamp`/`block.number` and
  *      NEVER writes storage — all it does is a RAW check against stored day-indexed counters,
@@ -428,11 +431,11 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      transaction). Re-derived after the latch + effective-cap clamp landed
     ///      (the clamp adds one `globalDailyCapCeiling` SLOAD, cold in the probe, warm in the real
     ///      flow). All four branches the probe can reach, measured by that test:
-    ///        unprovisioned (COLD `!sponsored`, probe's own storage never touched)  **76,759** <- probe-only
-    ///        sponsored, under cap (latch branch not taken)                          59,715
-    ///        sponsored, over cap (latch fires: SSTORE + LOG2)                       61,441  <- reachable worst
-    ///        VIP, over cap (latch fires — VIP is not exempt)                        61,441  <- reachable worst
-    ///      The 76,759 NUMBER is unreachable in production, but do not read that as "the
+    ///        unprovisioned (COLD `!sponsored`, probe's own storage never touched)  **77,038** <- probe-only
+    ///        sponsored, under cap (latch branch not taken)                          59,996
+    ///        sponsored, over cap (latch fires: SSTORE + LOG2)                       61,789
+    ///        VIP, over cap (latch fires — VIP is not exempt)                        63,251  <- reachable worst
+    ///      The 77,038 NUMBER is unreachable in production, but do not read that as "the
     ///      `!p.sponsored` branch inside `_postOp` is unreachable" — it is NOT the same claim, and
     ///      the branch IS reachable. What is actually unreachable is the COLD-STORAGE COMBINATION
     ///      the probe measures: a wallet that was NEVER sponsored can never reach `_postOp` at all
@@ -444,29 +447,36 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      SAME wallet in the SAME bundle already cleared validation) DOES reach `_postOp` with
     ///      `p.sponsored == false` in storage for those later ops — the branch executes in
     ///      production, just on WARM storage (the SAME wallet's slot, just written by an earlier
-    ///      op in this very transaction), which is cheap, not 76,759. The REACHABLE worst case
-    ///      across every combination this constant must cover remains the latched / VIP-latched
-    ///      branch at 61,441, so the real margin is 90,000 - 61,441 = 28,559 gas = 46%, not the
-    ///      13,241 gas / 17.3% the 76,759 pin implies. 76,759 is kept as the constant's derivation
-    ///      on purpose — it is the conservative direction, and the probe test asserting it stays
-    ///      the ceiling is what dies first if `_postOp` ever gets more expensive. The
-    ///      probe test used to measure ONLY the unprovisioned case, so the latch branch was dead in
-    ///      the one test guarding this constant; it now measures all four and asserts the
-    ///      unprovisioned case remains the ceiling. A higher floor is strictly safer (it only means
-    ///      a userOp must forward more `paymasterPostOpGasLimit`, not that `_postOp` actually costs
-    ///      more) — if `_postOp`'s logic ever changes, re-run the probe test and re-derive this.
+    ///      op in this very transaction), which is cheap, not 77,038. The REACHABLE worst case
+    ///      across every combination this constant must cover is the VIP-latched branch at 63,251,
+    ///      so the real margin is 90,000 - 63,251 = 26,749 gas = ~29.7%, not the 12,962 gas /
+    ///      ~14.4% the 77,038 pin implies. 77,038 is kept as the constant's derivation on purpose —
+    ///      it is the conservative direction, and the probe test asserting it stays the ceiling is
+    ///      what dies first if `_postOp` ever gets more expensive. The probe test measures all four
+    ///      branches and asserts the unprovisioned case remains the ceiling. A higher floor is
+    ///      strictly safer (it only means a userOp must forward more `paymasterPostOpGasLimit`, not
+    ///      that `_postOp` actually costs more) — if `_postOp`'s logic ever changes, re-run the
+    ///      probe test and re-derive this.
     uint128 public constant MIN_POSTOP_GAS = 90_000;
 
     uint128 public constant MAX_POSTOP_GAS = 150_000;
 
     /// @dev Layout of the `paymasterData` tail of `paymasterAndData` (everything past
-    ///      `PAYMASTER_DATA_OFFSET`): `validUntil(6) | validAfter(6) | signature(65)`. Exact-length,
-    ///      not minimum-length: a longer tail would let a caller append bytes that no signature
-    ///      covers, and `ECDSA.tryRecover` accepts only a 65-byte signature anyway.
-    uint256 private constant PAYMASTER_DATA_LENGTH = 77;
+    ///      `PAYMASTER_DATA_OFFSET`): `validUntil(6) | validAfter(6) | minSigLen(2) | signature(65)`
+    ///      = 79 bytes. Exact-length, not minimum-length: a longer tail would let a caller append
+    ///      bytes that no signature covers, and `ECDSA.tryRecover` accepts only a 65-byte
+    ///      signature anyway.
+    ///
+    ///      SSA-02: `minSigLen` is the sponsor's signed lower bound on `userOp.signature.length`,
+    ///      checked in {_validatePaymasterUserOp}. A FLOOR rather than an exact bind because a
+    ///      passkey WebAuthn assertion's exact byte length is not known until the user
+    ///      authenticates, and `paymasterAndData` is part of `userOpHash` so the sponsor must sign
+    ///      first.
+    uint256 private constant PAYMASTER_DATA_LENGTH = 79;
 
-    /// @dev Where the 65-byte signature starts inside that tail — i.e. past both timestamps.
-    uint256 private constant SIGNATURE_OFFSET = 12;
+    /// @dev Where the 65-byte signature starts inside that tail — i.e. past both timestamps AND
+    ///      `minSigLen` (6 + 6 + 2).
+    uint256 private constant SIGNATURE_OFFSET = 14;
 
     /// @dev Mirrors StarzipWallet.MAX_BATCH_SIZE — caps the executeBatch decode loop. Duplicated,
     ///      unpinned (two separate `constant` declarations, not one shared source — see
@@ -554,11 +564,14 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     uint128 public maxSponsoredOpCost;
 
     // slot 8
-    /// @inheritdoc IPaymasterSelectorPolicy
-    /// @dev Appended AFTER `maxSponsoredOpCost` so slots 0-7 stay byte-identical (this contract is
-    ///      non-upgradeable, so the append is discipline rather than a hard requirement — an
-    ///      already-deployed paymaster cannot gain this gate and must be redeployed + reprovisioned).
-    mapping(address => mapping(bytes4 => bool)) public override targetSelectorAllowlist;
+    /// @dev RAW (target, selector) allowlist storage. Appended AFTER `maxSponsoredOpCost` so slots
+    ///      0-7 stay byte-identical (this contract is non-upgradeable, so the append is discipline
+    ///      rather than a hard requirement — an already-deployed paymaster cannot gain this gate and
+    ///      must be redeployed + reprovisioned).
+    ///
+    ///      SSA-10: NOT the effective sponsorship status — read the {targetSelectorAllowlist} view
+    ///      instead, except in the setters that maintain this raw mapping and its generation stamp.
+    mapping(address => mapping(bytes4 => bool)) private _targetSelectorAllowlistRaw;
 
     // slot 9 (packed)
     /// @dev Per-op cap on the declared `maxFeePerGas`: bounds what the userOp's
@@ -613,6 +626,16 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     ///      `address(0)` and so does the setter, so a failed `ECDSA.tryRecover` (which yields
     ///      `address(0)`) can never accidentally match a live signer.
     address public sponsorSigner;
+
+    // slot 12
+    /// @dev SSA-10. Per-target epoch counter, bumped only when {setBusinessTarget}/
+    ///      {setBusinessTargets} transitions `target` from allowed to disallowed.
+    mapping(address => uint256) public businessTargetGeneration;
+
+    // slot 13
+    /// @dev SSA-10. The {businessTargetGeneration} value of `target` at the moment
+    ///      `_targetSelectorAllowlistRaw[target][selector]` was last written.
+    mapping(address => mapping(bytes4 => uint256)) public targetSelectorAllowlistGeneration;
 
     // ============ Events ============
     event PolicyManagerChanged(address indexed previousManager, address indexed newManager);
@@ -677,6 +700,14 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     error WalletDoesNotTrustThisPaymaster();
     error WalletNotDeployed();
     error SignerCannotBeOwner();
+    /// @dev SSA-01. Also thrown, fail-closed, when the `pendingImplementation()` staticcall itself
+    ///      fails or returns malformed data.
+    error WalletUpgradePending();
+    /// @dev SSA-01. Permanent, not one-time: a wallet that has ever upgraded away from the trusted
+    ///      implementation may no longer honor the `execute`/`executeBatch` ABI
+    ///      {_validatePaymasterUserOp} parses. Also thrown, fail-closed, when the
+    ///      `hasBeenUpgraded()` staticcall itself fails or returns malformed data.
+    error WalletImplementationChanged();
 
     // ============ Modifiers ============
     modifier onlyPolicyManager() {
@@ -868,17 +899,27 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         emit VipSet(wallet, on);
     }
 
+    /// @dev SSA-10: bumps {businessTargetGeneration}[target] only on the true->false transition, so
+    ///      selectors may be pre-approved before a target's first activation and an idempotent
+    ///      re-activation never discards the current selector set.
     function setBusinessTarget(address target, bool allowed) external onlyOwner {
         if (target == address(0)) revert ZeroAddress();
+        if (!allowed && businessAllowlist[target]) {
+            ++businessTargetGeneration[target];
+        }
         businessAllowlist[target] = allowed;
         emit BusinessTargetSet(target, allowed);
     }
 
+    /// @dev Batch form of {setBusinessTarget}; same per-target generation-bump-on-removal rule.
     function setBusinessTargets(address[] calldata targets, bool allowed) external onlyOwner {
         uint256 len = targets.length;
         for (uint256 i = 0; i < len; ) {
             address target = targets[i];
             if (target == address(0)) revert ZeroAddress();
+            if (!allowed && businessAllowlist[target]) {
+                ++businessTargetGeneration[target];
+            }
             businessAllowlist[target] = allowed;
             emit BusinessTargetSet(target, allowed);
             unchecked {
@@ -890,21 +931,27 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
     /// @inheritdoc IPaymasterSelectorPolicy
     /// @dev Owner-only (cold), mirroring {setBusinessTarget}: this is the fine-grained half of the
     ///      same business gate, so it must not be reachable from the hot policyManager key.
+    ///      SSA-10: stamps the entry with `target`'s CURRENT {businessTargetGeneration} so it reads
+    ///      as effective under {targetSelectorAllowlist} until the next removal.
     function setTargetSelector(address target, bytes4 selector, bool allowed) external override onlyOwner {
         if (target == address(0)) revert ZeroAddress();
-        targetSelectorAllowlist[target][selector] = allowed;
+        _targetSelectorAllowlistRaw[target][selector] = allowed;
+        targetSelectorAllowlistGeneration[target][selector] = businessTargetGeneration[target];
         emit TargetSelectorUpdated(target, selector, allowed);
     }
 
     /// @inheritdoc IPaymasterSelectorPolicy
     /// @dev Emits the per-entry {TargetSelectorUpdated} as well as the batch summary, so indexers
     ///      tracking only the singular event still see a complete record of every state change.
+    ///      SSA-10: same current-generation stamp as {setTargetSelector}, per entry.
     function setTargetSelectors(address target, bytes4[] calldata selectors, bool allowed) external override onlyOwner {
         if (target == address(0)) revert ZeroAddress();
+        uint256 generation = businessTargetGeneration[target];
         uint256 len = selectors.length;
         for (uint256 i = 0; i < len; ) {
             bytes4 selector = selectors[i];
-            targetSelectorAllowlist[target][selector] = allowed;
+            _targetSelectorAllowlistRaw[target][selector] = allowed;
+            targetSelectorAllowlistGeneration[target][selector] = generation;
             emit TargetSelectorUpdated(target, selector, allowed);
             unchecked {
                 ++i;
@@ -913,19 +960,15 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         emit TargetSelectorsBatchUpdated(target, len, allowed);
     }
 
-    function revokeTargetSelectors(address target, bytes4[] calldata selectors) external onlyOwner {
-        if (target == address(0)) revert ZeroAddress();
-        uint256 len = selectors.length;
-        for (uint256 i = 0; i < len; ) {
-            bytes4 selector = selectors[i];
-            if (targetSelectorAllowlist[target][selector]) {
-                targetSelectorAllowlist[target][selector] = false;
-                emit TargetSelectorUpdated(target, selector, false);
-            }
-            unchecked {
-                ++i;
-            }
+    /// @notice Whether `selector` on `target` is currently sponsored.
+    /// @dev SSA-10. An entry stamped before the target's most recent removal reads as `false` here
+    ///      even though the raw bool underneath was never individually cleared.
+    /// @inheritdoc IPaymasterSelectorPolicy
+    function targetSelectorAllowlist(address target, bytes4 selector) public view override returns (bool) {
+        if (targetSelectorAllowlistGeneration[target][selector] != businessTargetGeneration[target]) {
+            return false;
         }
+        return _targetSelectorAllowlistRaw[target][selector];
     }
 
     /// @dev Reverts `ForbiddenSelfSelector` for the three selectors on StarzipWallet's
@@ -1164,6 +1207,16 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         if (!ok || ret.length != 32 || abi.decode(ret, (address)) != address(this)) {
             revert WalletDoesNotTrustThisPaymaster();
         }
+        // SSA-01: any staticcall failure or malformed return is treated as untrusted, matching the
+        // `trustedPaymaster()` check above.
+        (bool pOk, bytes memory pRet) = wallet.staticcall(abi.encodeWithSignature("pendingImplementation()"));
+        if (!pOk || pRet.length != 32 || abi.decode(pRet, (address)) != address(0)) {
+            revert WalletUpgradePending();
+        }
+        (bool uOk, bytes memory uRet) = wallet.staticcall(abi.encodeWithSignature("hasBeenUpgraded()"));
+        if (!uOk || uRet.length != 32 || abi.decode(uRet, (bool))) {
+            revert WalletImplementationChanged();
+        }
     }
 
     function setSponsoredCounterfactual(
@@ -1255,16 +1308,20 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
      *      signer approved is the gas the op must declare.
      *
      *      `paymasterAndData[PAYMASTER_VALIDATION_GAS_OFFSET:PAYMASTER_DATA_OFFSET]` is the
-     *      paymaster's own two gas limits, covered for the same reason. The 77-byte tail past
+     *      paymaster's own two gas limits, covered for the same reason. The 79-byte tail past
      *      that offset is NOT covered and cannot be — it holds this very signature.
      *
      *      `nonce` makes each signature single-use; `block.chainid` and `address(this)` stop one
      *      from being replayed onto another chain or another deployment of this contract.
+     *
+     *      SSA-02: `minSigLen` is in the preimage so it cannot be altered after the signer
+     *      approved it — see {PAYMASTER_DATA_LENGTH}.
      */
     function getHash(
         PackedUserOperation calldata userOp,
         uint48 validUntil,
-        uint48 validAfter
+        uint48 validAfter,
+        uint16 minSigLen
     ) public view returns (bytes32) {
         return
             keccak256(
@@ -1280,7 +1337,8 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
                     block.chainid,
                     address(this),
                     validUntil,
-                    validAfter
+                    validAfter,
+                    minSigLen
                 )
             );
     }
@@ -1321,9 +1379,10 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             return ("", _packValidationData(true, 0, 0));
         }
         uint48 sigValidUntil = uint48(bytes6(paymasterData[0:6]));
-        uint48 sigValidAfter = uint48(bytes6(paymasterData[6:SIGNATURE_OFFSET]));
+        uint48 sigValidAfter = uint48(bytes6(paymasterData[6:12]));
+        uint16 minSigLen = uint16(bytes2(paymasterData[12:SIGNATURE_OFFSET]));
         (address recovered, ECDSA.RecoverError recoverErr, ) = ECDSA.tryRecover(
-            MessageHashUtils.toEthSignedMessageHash(getHash(userOp, sigValidUntil, sigValidAfter)),
+            MessageHashUtils.toEthSignedMessageHash(getHash(userOp, sigValidUntil, sigValidAfter, minSigLen)),
             paymasterData[SIGNATURE_OFFSET:]
         );
         // `recovered == address(0)` is redundant with the `NoError` check and with
@@ -1338,6 +1397,12 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
         }
         if (recoverErr != ECDSA.RecoverError.NoError || recovered == address(0) || recovered != sponsorSigner) {
             return ("", _packValidationData(true, sigValidUntil, sigValidAfter));
+        }
+
+        // SSA-02: `minSigLen == 0` means the sponsor never bound a floor, which would silently
+        // disable this check, so it is declined explicitly. See {PAYMASTER_DATA_LENGTH}.
+        if (minSigLen == 0 || userOp.signature.length < minSigLen) {
+            return ("", _packValidationData(true, 0, 0));
         }
 
         uint128 postOpGas = uint128(
@@ -1670,7 +1735,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
             uint256 dataPos = lenPos + 32; // <= callData.length by the bound above
             if (funcLen < 4 || funcLen > callData.length - dataPos) return false;
             bytes4 innerSel = bytes4(callData[dataPos:dataPos + 4]);
-            return isSelf ? selfSelectorAllowlist[innerSel] : targetSelectorAllowlist[target][innerSel];
+            return isSelf ? selfSelectorAllowlist[innerSel] : targetSelectorAllowlist(target, innerSel);
         }
 
         if (sel == StarzipWallet.executeBatch.selector) {
@@ -1722,7 +1787,7 @@ contract VerifyingPaymaster is BasePaymaster, IPaymasterSelectorPolicy {
                 uint256 elDataPos = elLenPos + 32; // <= callData.length by the bound above
                 if (elLen < 4 || elLen > callData.length - elDataPos) return false;
                 bytes4 innerSel = bytes4(callData[elDataPos:elDataPos + 4]);
-                bool elementOk = isSelf ? selfSelectorAllowlist[innerSel] : targetSelectorAllowlist[target][innerSel];
+                bool elementOk = isSelf ? selfSelectorAllowlist[innerSel] : targetSelectorAllowlist(target, innerSel);
                 if (!elementOk) return false;
                 unchecked {
                     ++i;

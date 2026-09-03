@@ -25,6 +25,12 @@
  *
  * The paymaster contract is NOT modified: this is a client-side gas-budgeting requirement.
  *
+ * RE-MEASURED for SSA-10: the generation counter and per-(target, selector) stamp add
+ * `businessTargetGeneration[target]` (1 keccak, 1 SLOAD) and
+ * `targetSelectorAllowlistGeneration[target][selector]` (2 keccaks, 1 SLOAD) per business element
+ * — +2 SLOADs, +3 keccaks, cold on first touch. The three business-path constants below were
+ * re-bisected accordingly; the self path is untouched and its constants are unchanged.
+ *
  * ITEM 4 ADDITION (T4.11): `selfSelectorAllowlist[selector]` is a ONE-level mapping (1 keccak, 1
  * SLOAD) versus the business path's TWO-level `businessAllowlist[target]` +
  * `targetSelectorAllowlist[target][selector]` (a 2-level mapping: 3 keccaks, 2 SLOADs) — see
@@ -86,12 +92,13 @@ const LEGACY_PM_VERIFICATION_GAS = 100_000n;
  * path. RE-MEASURED for SSA-02 (per-op sponsor-signature verification: 2 keccak256 + a 12-field
  * abi.encode + ecrecover + a cold SLOAD for the sponsor signer, added to every
  * `validatePaymasterUserOp` call): 230_000 fails, 235_000 is the first rung that sponsors — up
- * from the pre-SSA-02 (215_000 fails, 220_000 passes). Set at 270_000 for a ~15% margin (was
- * 250_000 / ~14%). Clients building batches MUST use at least this value; the fixed 100_000
- * every other paymaster test uses is no longer safe even for same-target batches — see
- * `SAME_TARGET_BATCH32_PM_VERIFICATION_GAS` below.
+ * from the pre-SSA-02 (215_000 fails, 220_000 passes). RE-MEASURED for SSA-10 (see the file
+ * header): 375_000 fails, 380_000 is the first rung that sponsors. Set at 400_000 for a ~5%
+ * margin. Clients building batches MUST use at
+ * least this value; the fixed 100_000 every other paymaster test uses is no longer safe even for
+ * same-target batches — see `SAME_TARGET_BATCH32_PM_VERIFICATION_GAS` below.
  */
-const BATCH32_PM_VERIFICATION_GAS = 270_000n;
+const BATCH32_PM_VERIFICATION_GAS = 400_000n;
 /**
  * Required `paymasterVerificationGasLimit` for a 32-call batch over a SINGLE (repeated, warm)
  * target — added for SSA-02. Before SSA-02, this fit comfortably under the shared
@@ -99,11 +106,13 @@ const BATCH32_PM_VERIFICATION_GAS = 270_000n;
  * overhead SSA-02 added (see `BATCH32_PM_VERIFICATION_GAS`'s comment) applies once per
  * `validatePaymasterUserOp` call regardless of batch size or target distinctness, and is now by
  * itself large enough to push even this warm/same-target case past 100_000. Bisected floor:
- * 109_000 fails, 110_000 is the first rung that sponsors. Set at 115_000 for headroom — still a
- * small fraction of `BATCH32_PM_VERIFICATION_GAS`, so the DISTINCT-target cost driver this file
- * exists to isolate is unchanged; only the flat floor moved.
+ * 109_000 fails, 110_000 is the first rung that sponsors. RE-MEASURED for SSA-10 (only the
+ * target's first, cold touch pays the two extra reads; elements 2-32 repeat the same target and
+ * are warm): 125_000 fails, 130_000 is the first rung that sponsors. Set at 135_000 — still a small
+ * fraction of `BATCH32_PM_VERIFICATION_GAS`, so the DISTINCT-target cost driver this file exists
+ * to isolate is unchanged; only the flat floor moved.
  */
-const SAME_TARGET_BATCH32_PM_VERIFICATION_GAS = 115_000n;
+const SAME_TARGET_BATCH32_PM_VERIFICATION_GAS = 135_000n;
 
 // n distinct, code-less addresses starting at `base`. A `call` into an account with no code
 // always succeeds, so the inner business calls are free no-ops and the measurement isolates the
@@ -304,8 +313,9 @@ describe("VerifyingPaymaster batch verification gas", function () {
     // Coarse ladder rather than a binary search, so the evidence reads as a table.
     // RE-MEASURED for SSA-02 (per-op signature verification, see BATCH32_PM_VERIFICATION_GAS's
     // comment): 215k/220k/225k/230k all fail, 235k is the first rung that sponsors — up from the
-    // pre-SSA-02 200k/205k/210k/215k fail, 220k passes.
-    const ladder = [100_000n, 150_000n, 200_000n, 230_000n, 235_000n, 270_000n];
+    // pre-SSA-02 200k/205k/210k/215k fail, 220k passes. RE-MEASURED for SSA-10:
+    // 235k/270k/300k/330k/360k/375k all fail, 380k is the first rung that sponsors.
+    const ladder = [100_000n, 150_000n, 200_000n, 230_000n, 270_000n, 375_000n, 380_000n, 400_000n];
     const outcomes: Array<[bigint, boolean]> = [];
     for (const limit of ladder) {
       const g = await loadFixture(fixture);
@@ -328,8 +338,8 @@ describe("VerifyingPaymaster batch verification gas", function () {
     // Band assertion, not an exact equality: a solc/EntryPoint bump may move the rung a little,
     // but it must not silently drift past the constant clients are told to use.
     assert.ok(
-      firstOk[0] > 230_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
-      `threshold ${firstOk[0]} left the documented (230k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
+      firstOk[0] > 375_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
+      `threshold ${firstOk[0]} left the documented (375k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
     );
     // Monotonic: once a limit works, every larger limit must work too.
     for (let i = outcomes.indexOf(firstOk); i < outcomes.length; i++) {
@@ -356,14 +366,17 @@ describe("VerifyingPaymaster batch verification gas", function () {
   //       alone (~10.5k) is now enough to push this PAST the shared `LEGACY_PM_VERIFICATION_GAS`
   //       baseline too, so an all-self admin batch now DOES need a small client-side bump.
   //     MIXED: 168_000 fails, 169_000 is the first rung that sponsors.
+  //   RE-MEASURED for SSA-10 (only MIXED's 16 business elements pay the extra 2 SLOADs each):
+  //     ALL-SELF: unchanged (100_000 fails, 100_500 passes).
+  //     MIXED: 239_000 fails, 240_000 is the first rung that sponsors.
   // Both confirm §0 of the plan: the self path is `selfSelectorAllowlist[sel]` (1 keccak, 1
   // SLOAD) versus the business path's `businessAllowlist[target]` +
   // `targetSelectorAllowlist[target][sel]` (3 keccaks, 2 SLOADs) — strictly cheaper per element.
   // `BATCH32_PM_VERIFICATION_GAS` does NOT need to move for item 4: these figures are LOWER than
   // the all-business case, never higher.
   const CALL_GAS_SELF = 2_500_000n; // sized for 32 real addOwnerAddress state writes
-  const SELF_BATCH32_PM_VERIFICATION_GAS = 115_000n; // measured floor (100_000 fails, 100_500 passes); was 100_000 (== LEGACY), pre-SSA-02 floor 90_000
-  const MIXED_BATCH32_PM_VERIFICATION_GAS = 170_000n; // measured floor (168_000 fails, 169_000 passes); was 160_000 (155_000 fails, pre-SSA-02)
+  const SELF_BATCH32_PM_VERIFICATION_GAS = 115_000n; // measured floor (100_000 fails, 100_500 passes); was 100_000 (== LEGACY), pre-SSA-02 floor 90_000. Unchanged by SSA-10.
+  const MIXED_BATCH32_PM_VERIFICATION_GAS = 245_000n; // measured floor after SSA-10 (239_000 fails, 240_000 passes); was 170_000 pre-SSA-10
 
   function selfCallData(walletAbi: Abi, newOwner: Address): Hex {
     return encodeFunctionData({
@@ -467,15 +480,16 @@ describe("VerifyingPaymaster batch verification gas", function () {
     const newOwners = distinctAddrs(16, 0x9000);
     // RE-MEASURED for SSA-02 (per-op signature verification, see BATCH32_PM_VERIFICATION_GAS's
     // comment): 168_000 fails, 169_000 is the first rung that sponsors — pre-SSA-02 this was
-    // 155_000 fails, 160_000 passes.
+    // 155_000 fails, 160_000 passes. RE-MEASURED for SSA-10:
+    // 169_000/200_000/230_000/239_000 all fail, 240_000 is the first rung that sponsors.
     const ladder = [
       130_000n,
-      145_000n,
-      150_000n,
-      155_000n,
       165_000n,
-      168_000n,
       169_000n,
+      200_000n,
+      230_000n,
+      239_000n,
+      240_000n,
       MIXED_BATCH32_PM_VERIFICATION_GAS,
     ];
     const outcomes: Array<[bigint, boolean]> = [];
@@ -499,8 +513,8 @@ describe("VerifyingPaymaster batch verification gas", function () {
     const firstOk = outcomes.find(([, ok]) => ok);
     assert.ok(firstOk, `no ladder rung sponsored the mixed batch: ${rendered}`);
     assert.ok(
-      firstOk[0] > 165_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
-      `mixed threshold ${firstOk[0]} left the measured (165k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
+      firstOk[0] > 239_000n && firstOk[0] <= BATCH32_PM_VERIFICATION_GAS,
+      `mixed threshold ${firstOk[0]} left the measured (239k, ${BATCH32_PM_VERIFICATION_GAS}] band (${rendered})`,
     );
     for (let i = outcomes.indexOf(firstOk); i < outcomes.length; i++) {
       assert.ok(outcomes[i][1], `limit ${outcomes[i][0]} regressed after ${firstOk[0]} passed`);

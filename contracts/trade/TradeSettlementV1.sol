@@ -13,6 +13,7 @@ import "@openzeppelin/contracts/token/ERC20/extensions/IERC20Permit.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
+import "@openzeppelin/contracts/interfaces/IERC1271.sol";
 import "@openzeppelin/contracts/utils/math/Math.sol";
 
 /**
@@ -78,7 +79,16 @@ contract TradeSettlementV1 is
     uint256 public constant MAX_BATCH_SIZE = 50;
     uint256 public constant MAX_WITHDRAWAL_DELAY = 7 days;
 
-    uint256 public constant ITEM_GAS_BUDGET = 500_000;
+    // SSA-17: 500,000 -> 700,000. Derivation: 373,402 gas (measured, one genuine two-leg fill) +
+    // 2 x ERC1271_GAS_STIPEND (worst case spends it twice per item) + ~10% margin.
+    uint256 public constant ITEM_GAS_BUDGET = 700_000;
+
+    // SSA-17 / F6: gas stipend for the ERC-1271 `isValidSignature` staticcall in
+    // `_authorizeOrderSig`, replacing SignatureChecker's unbounded forward. Measured directly
+    // (test/TradeSettlementV1_f6_erc1271GasStipend.test.ts, not `validateUserOp` on a different
+    // path): StarzipWallet.isValidSignature worst case (passkey/WebAuthn owner) = 45,406 gas, EOA
+    // owner = 36,682 gas. 120,000 is ~2.64x the measured worst case (~164% margin).
+    uint256 private constant ERC1271_GAS_STIPEND = 120_000;
 
     // Length of one withdrawal-rate-limit accounting window. A CONSTANT, never an owner
     // parameter: throughput is limit/window, so a settable window is a second, unsealed knob for
@@ -673,6 +683,16 @@ contract TradeSettlementV1 is
     ///      that quietly swallows every item. Send more gas or send a smaller batch.
     error BatchOutOfGas(uint256 index);
     error ItemOutOfGas(uint256 index);
+    /// @dev SSA-17: this item's own remaining gas cannot guarantee `ERC1271_GAS_STIPEND` reaches
+    ///      the ERC-1271 callee under EIP-150's 63/64 rule. Signals an underfunded batch, not an
+    ///      invalid item — `settleOrdersBatch` routes this selector through the same branch as an
+    ///      empty-returndata out-of-gas.
+    error InsufficientGasForSigCheck();
+    /// @dev SSA-17: the ERC-1271 staticcall reverted with no return data despite receiving the full
+    ///      `ERC1271_GAS_STIPEND`. Kept distinct from `InvalidSignature` because the raw
+    ///      (success, returndata) pair cannot distinguish "callee ran out of gas" from
+    ///      "callee returned false".
+    error Erc1271VerificationStarved();
     /// @dev A per-window session-key cap above type(uint192).max, which `SpendWindow.used` cannot
     ///      hold. See `_writeSessionKeyCaps`.
     error InvalidSessionKeyCap();
@@ -1042,7 +1062,14 @@ contract TradeSettlementV1 is
                 // The raw revert data is forwarded so the operator can decode the same custom error
                 // it would have seen from a single-item settle — collapsing every failure into a
                 // flag would make a batch strictly harder to debug than the calls it replaces.
-                if (reason.length == 0) {
+                //
+                // SSA-17: `InsufficientGasForSigCheck` reverts WITH data (a bare selector) but
+                // means the batch was underfunded, not that the item is invalid, so it takes the
+                // same branch as an empty-returndata out-of-gas. `Erc1271VerificationStarved` is
+                // deliberately NOT included — that one is a genuine per-item failure.
+                bool starvedFrame = reason.length == 0 ||
+                    (reason.length == 4 && bytes4(reason) == InsufficientGasForSigCheck.selector);
+                if (starvedFrame) {
                     if (gasleft() >= ITEM_GAS_BUDGET / 63) {
                         emit SettlementFailed(
                             items[i].settlementId,
@@ -1310,6 +1337,9 @@ contract TradeSettlementV1 is
         _assertNoDuplicateTokens(tokens);
         _assertKeyAllowed(sessionKey);
         sessionKeyValidUntil[msg.sender][sessionKey] = validUntil;
+        // Bump on every (re-)registration, not just on revoke, so a token omitted from this call
+        // reverts to its fail-closed default of 0 instead of keeping a stale cap.
+        ++sessionKeyGeneration[msg.sender][sessionKey];
 
         for (uint256 i = 0; i < tokens.length; ) {
             _writeSessionKeyCaps(msg.sender, sessionKey, tokens[i], caps[i], orderCaps[i]);
@@ -1410,6 +1440,8 @@ contract TradeSettlementV1 is
 
         sessionKeyRegNonce[a.account]++;
         sessionKeyValidUntil[a.account][a.sessionKey] = a.validUntil;
+        // See the matching comment in registerSessionKey.
+        ++sessionKeyGeneration[a.account][a.sessionKey];
 
         for (uint256 i = 0; i < a.tokens.length; ) {
             _writeSessionKeyCaps(a.account, a.sessionKey, a.tokens[i], a.caps[i], a.orderCaps[i]);
@@ -1512,9 +1544,63 @@ contract TradeSettlementV1 is
             }
         }
 
-        if (SignatureChecker.isValidSignatureNow(order.account, orderHash, sig)) return address(0);
+        if (_isValidSignatureNowStipended(order.account, orderHash, sig)) return address(0);
 
         revert InvalidSignature();
+    }
+
+    /**
+     * @dev SSA-17. Drop-in for `SignatureChecker.isValidSignatureNow`, used only by
+     *      `_authorizeOrderSig`: identical for an EOA `signer`, but a contract `signer`'s ERC-1271
+     *      `isValidSignature` is called through `_isValidERC1271SignatureStipended` with a bounded
+     *      gas stipend instead of `SignatureChecker`'s unbounded forward.
+     * @param signer The order account being authorized.
+     * @param hash The order digest.
+     * @param signature The signature bytes to verify against `signer`.
+     */
+    function _isValidSignatureNowStipended(address signer, bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (bool)
+    {
+        if (signer.code.length == 0) {
+            (address recovered, ECDSA.RecoverError err, ) = ECDSA.tryRecover(hash, signature);
+            return err == ECDSA.RecoverError.NoError && recovered == signer;
+        }
+        return _isValidERC1271SignatureStipended(signer, hash, signature);
+    }
+
+    /**
+     * @dev SSA-17: an ERC-1271 `isValidSignature` staticcall bounded to `ERC1271_GAS_STIPEND`, so
+     *      an attacker-controlled wallet cannot burn one item's `ITEM_GAS_BUDGET` and starve the
+     *      rest of the batch.
+     * @param account An address already confirmed to have code (see `_isValidSignatureNowStipended`).
+     * @return isValid True iff `account` returned the ERC-1271 magic value within the stipend.
+     */
+    function _isValidERC1271SignatureStipended(address account, bytes32 hash, bytes calldata signature)
+        internal
+        view
+        returns (bool isValid)
+    {
+        if (account.code.length == 0) return false;
+
+        // EIP-150: a sub-call only ever receives floor(gas, 63/64) of what THIS frame currently
+        // holds. If this frame doesn't hold enough to guarantee the callee sees the FULL stipend,
+        // fail loudly here (non-empty revert data) rather than silently forwarding less than
+        // intended and risking a starved callee being misread as "invalid".
+        uint256 g = gasleft();
+        if (g - g / 64 < ERC1271_GAS_STIPEND) revert InsufficientGasForSigCheck();
+
+        (bool ok, bytes memory ret) = account.staticcall{gas: ERC1271_GAS_STIPEND}(
+            abi.encodeCall(IERC1271.isValidSignature, (hash, signature))
+        );
+
+        // F5: OZ SignatureChecker-identical strictness — full 32-byte compare of returndata.
+        if (ok && ret.length >= 32 && abi.decode(ret, (bytes32)) == bytes32(IERC1271.isValidSignature.selector)) {
+            return true;
+        }
+        if (!ok && ret.length == 0) revert Erc1271VerificationStarved();
+        return false;
     }
 
     /**

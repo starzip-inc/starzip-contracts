@@ -378,11 +378,24 @@ export const SPONSOR_SIGNER: Address = sponsorSignerAccount.address;
 export const UNLIMITED_VALID_UNTIL: bigint = (1n << 48n) - 1n;
 
 /**
+ * SSA-02: default `minSigLen` for callers that do not pass their own. Must be non-zero, since
+ * `VerifyingPaymaster._validatePaymasterUserOp` hard-declines `minSigLen == 0`.
+ *
+ * Derivation: 224 is the structural floor of every `userOp.signature` this codebase submits —
+ * `_decodeSignatureWrapper`'s 128-byte `SignatureWrapper` header plus the shortest legal
+ * `signatureData`, a raw 65-byte secp256k1 signature padded to 96 bytes. 128 + 96 = 224.
+ */
+export const DEFAULT_MIN_SIG_LEN: bigint = 224n;
+
+/**
  * Mirrors `VerifyingPaymaster.getHash` in TypeScript. Deliberately a SECOND implementation rather
  * than a `getHash()` call: the signing server has to build this preimage on its own, and a test
  * that just asks the contract would pass even if the two ever disagreed. One test asserts this
  * function equals the contract's `getHash()`; that assertion is the drift guard, and its output is
  * the golden vector the server checks itself against.
+ *
+ * SSA-02: `minSigLen` (uint16) is the 13th and last encoded field, mirroring
+ * `VerifyingPaymaster.getHash`. Defaults to `DEFAULT_MIN_SIG_LEN`, never `0`.
  */
 export function paymasterGetHash(params: {
   userOp: PackedUserOp;
@@ -390,8 +403,9 @@ export function paymasterGetHash(params: {
   chainId: bigint;
   validUntil: bigint;
   validAfter: bigint;
+  minSigLen?: bigint;
 }): Hex {
-  const { userOp, paymaster, chainId, validUntil, validAfter } = params;
+  const { userOp, paymaster, chainId, validUntil, validAfter, minSigLen = DEFAULT_MIN_SIG_LEN } = params;
   // paymasterAndData[20:52] — the paymaster's own verificationGasLimit | postOpGasLimit pair.
   const pmGasLimits = BigInt(`0x${userOp.paymasterAndData.slice(2 + 40, 2 + 40 + 64)}`);
   return keccak256(
@@ -409,6 +423,7 @@ export function paymasterGetHash(params: {
         { type: "address" },
         { type: "uint48" },
         { type: "uint48" },
+        { type: "uint16" },
       ],
       [
         userOp.sender,
@@ -423,6 +438,7 @@ export function paymasterGetHash(params: {
         paymaster,
         validUntil,
         validAfter,
+        Number(minSigLen),
       ],
     ),
   );
@@ -440,7 +456,7 @@ export function paymasterGetHash(params: {
 export async function withSignedPaymasterData<T extends PackedUserOp>(
   userOp: T,
   chainId: bigint,
-  opts?: { validUntil?: bigint; validAfter?: bigint; signerPriv?: Hex },
+  opts?: { validUntil?: bigint; validAfter?: bigint; minSigLen?: bigint; signerPriv?: Hex },
 ): Promise<T> {
   return {
     ...userOp,
@@ -449,15 +465,19 @@ export async function withSignedPaymasterData<T extends PackedUserOp>(
 }
 
 /**
- * Append a valid `validUntil | validAfter | signature` tail to a 52-byte `paymasterAndData`.
- * Returns the full 129-byte field. `signerPriv` defaults to the fixture signer; pass a different
- * key (or mutate the result) to build the decline cases.
+ * Append a valid `validUntil | validAfter | minSigLen | signature` tail to a 52-byte
+ * `paymasterAndData`. Returns the full 131-byte field. `signerPriv` defaults to the fixture
+ * signer; pass a different key (or mutate the result) to build the decline cases.
+ *
+ * `minSigLen` defaults to `DEFAULT_MIN_SIG_LEN`, never `0`. Pass an explicit value (including
+ * `0`, to exercise the declined case) to override it.
  */
 export async function signPaymasterData(params: {
   userOp: PackedUserOp;
   chainId: bigint;
   validUntil?: bigint;
   validAfter?: bigint;
+  minSigLen?: bigint;
   signerPriv?: Hex;
 }): Promise<Hex> {
   const {
@@ -465,6 +485,7 @@ export async function signPaymasterData(params: {
     chainId,
     validUntil = UNLIMITED_VALID_UNTIL,
     validAfter = 0n,
+    minSigLen = DEFAULT_MIN_SIG_LEN,
     signerPriv,
   } = params;
   const prefix = userOp.paymasterAndData.slice(0, 2 + 52 * 2) as Hex;
@@ -473,6 +494,7 @@ export async function signPaymasterData(params: {
     prefix,
     pad(toHex(validUntil), { size: 6 }),
     pad(toHex(validAfter), { size: 6 }),
+    pad(toHex(minSigLen), { size: 2 }),
   ]);
   const hash = paymasterGetHash({
     userOp: { ...userOp, paymasterAndData: withWindow },
@@ -480,6 +502,7 @@ export async function signPaymasterData(params: {
     chainId,
     validUntil,
     validAfter,
+    minSigLen,
   });
   const account = signerPriv ? privateKeyToAccount(signerPriv) : sponsorSignerAccount;
   // `signMessage({raw})` is EIP-191, matching the contract's `toEthSignedMessageHash`.
