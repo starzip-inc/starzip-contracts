@@ -83,6 +83,12 @@ contract TradeSettlementV1 is
     // 2 x ERC1271_GAS_STIPEND (worst case spends it twice per item) + ~10% margin.
     uint256 public constant ITEM_GAS_BUDGET = 700_000;
 
+    // SSA-17: worst-case slack for everything in `settleOrdersBatch` that is NOT one of the n
+    // metered sub-calls — the modifiers, the length check, the loop epilogue, and any per-item
+    // overhead beyond what the 64/63 term below already absorbs. Sized an order of magnitude
+    // above the measured loop cost so `requiredBatchGas` can only ever err conservative.
+    uint256 public constant BATCH_GAS_OVERHEAD = 150_000;
+
     // SSA-17 / F6: gas stipend for the ERC-1271 `isValidSignature` staticcall in
     // `_authorizeOrderSig`, replacing SignatureChecker's unbounded forward. Measured directly
     // (test/TradeSettlementV1_f6_erc1271GasStipend.test.ts, not `validateUserOp` on a different
@@ -683,6 +689,11 @@ contract TradeSettlementV1 is
     ///      that quietly swallows every item. Send more gas or send a smaller batch.
     error BatchOutOfGas(uint256 index);
     error ItemOutOfGas(uint256 index);
+    /// @dev SSA-17: `settleOrdersBatch` was entered with less than `requiredBatchGas(n)`. Reverting
+    ///      here, before any item runs and therefore before any untrusted ERC-1271 code is
+    ///      reached, is what makes the operator's gas figure state-independent. See
+    ///      `requiredBatchGas`.
+    error InsufficientBatchGas(uint256 required, uint256 available);
     /// @dev SSA-17: this item's own remaining gas cannot guarantee `ERC1271_GAS_STIPEND` reaches
     ///      the ERC-1271 callee under EIP-150's 63/64 rule. Signals an underfunded batch, not an
     ///      invalid item — `settleOrdersBatch` routes this selector through the same branch as an
@@ -1012,6 +1023,44 @@ contract TradeSettlementV1 is
     }
 
     /**
+     * @notice Worst-case gas `settleOrdersBatch` needs to carry `itemCount` items to completion.
+     * @dev THE number an operator sizes a settlement transaction with, and the reason that number
+     *      does not depend on chain state. `settleOrdersBatch` reverts below it, so
+     *      `eth_estimateGas` cannot converge on anything smaller — not even when it runs at a
+     *      moment when an untrusted ERC-1271 order account happens to be answering cheaply.
+     *
+     *      SSA-17. Without this check an operator could estimate a batch while a malicious
+     *      ERC-1271 wallet was cheap, the wallet could arm itself before the transaction landed,
+     *      and the now-expensive item would eat gas the later honest items needed — starving one
+     *      of them into an empty-returndata revert and rolling the WHOLE batch back through
+     *      `BatchOutOfGas`, already-settled items included. The attack lives entirely in the gap
+     *      between the estimate and the execution, and binding the entry check to the worst case
+     *      closes it: the accepted figure already assumes every item burns its full
+     *      `ITEM_GAS_BUDGET`, which is the most the metered sub-call can ever spend.
+     *
+     *      DERIVATION. Under EIP-150 a call forwards at most 63/64 of the caller's remaining gas,
+     *      so for `ITEM_GAS_BUDGET` to actually REACH an item this frame must hold
+     *      `ITEM_GAS_BUDGET * 64 / 63` at that moment. Worst case each item then consumes that
+     *      whole budget before the next one is reached, so the n terms add rather than overlap.
+     *      `BATCH_GAS_OVERHEAD` covers this frame's own costs, and the `/63` slack carried inside
+     *      every term (~11,111 gas) absorbs the per-item loop overhead on top of that.
+     *
+     *      OPERATOR CONTRACT, and it is not optional: submit every batch with a gas limit at or
+     *      above this value, and never take that limit from a bare `eth_estimateGas` reading of
+     *      live state. A gas limit is a ceiling, not a charge — unused gas is never paid for — so
+     *      sizing to the worst case costs nothing beyond holding the balance to back it. Note the
+     *      returned figure is a `gasleft()` floor measured INSIDE the call, so the transaction's
+     *      gas limit must be this plus the transaction's own intrinsic and calldata cost. Note
+     *      too that a full MAX_BATCH_SIZE batch needs ~35.7M gas here: size batches to the chain's
+     *      block gas limit, which on some chains means fewer than 50 items.
+     * @param itemCount Number of items in the batch. Keep it <= MAX_BATCH_SIZE.
+     * @return The minimum `gasleft()` `settleOrdersBatch` accepts for that many items.
+     */
+    function requiredBatchGas(uint256 itemCount) public pure returns (uint256) {
+        return (itemCount * ITEM_GAS_BUDGET * 64) / 63 + BATCH_GAS_OVERHEAD;
+    }
+
+    /**
      * @notice Settle up to MAX_BATCH_SIZE fills in one transaction, isolating per-item failures.
      * @dev The throughput entrypoint. Its reason for existing is NOT gas: on an L2 the calldata for
      *      each order and its two signatures still ships either way, and the isolating self-call
@@ -1045,11 +1094,24 @@ contract TradeSettlementV1 is
      *      rejection inside `_settleOne` is a custom error and therefore carries data; a bare
      *      revert can only be exhaustion. Bubbling it up is what makes gas estimation converge on
      *      an amount that actually settles, and what stops silent under-settlement in production.
+     *      GAS IS CHECKED UP FRONT. The loop can only keep the isolation promise above if every
+     *      item is still reachable with its full `ITEM_GAS_BUDGET`, so the batch refuses to start
+     *      without `requiredBatchGas(n)` in the frame. That is what makes the operator's gas
+     *      figure independent of anything an untrusted ERC-1271 account does between estimation
+     *      and execution (SSA-17), and it demotes the starvation branches below to defense in
+     *      depth: reachable only if the per-item loop overhead were ever to exceed the ~11,111 gas
+     *      of slack each term carries.
      * @param items Fills to settle, in order. Bounded by MAX_BATCH_SIZE.
      */
     function settleOrdersBatch(Settlement[] calldata items) external onlyOperator nonReentrant whenNotPaused {
         uint256 n = items.length;
         if (n > MAX_BATCH_SIZE) revert BatchTooLarge();
+
+        // SSA-17: refuse a batch that cannot be finished in the worst case, before any item runs
+        // and so before any untrusted ERC-1271 code is reached.
+        uint256 required = requiredBatchGas(n);
+        uint256 available = gasleft();
+        if (available < required) revert InsufficientBatchGas(required, available);
 
         for (uint256 i = 0; i < n; ) {
             // solhint-disable-next-line no-empty-blocks

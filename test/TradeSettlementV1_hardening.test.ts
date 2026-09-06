@@ -1604,10 +1604,9 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
       );
 
       // Re-register the same key, no revoke, omitting usdt entirely.
-      await settlement.write.registerSessionKey(
-        [sessionKey.address, expiry, [], [], []],
-        { account: alice.account },
-      );
+      await settlement.write.registerSessionKey([sessionKey.address, expiry, [], [], []], {
+        account: alice.account,
+      });
 
       assert.strictEqual(
         (await settlement.read.effectiveSessionKeySpendCap([
@@ -1850,11 +1849,14 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
         // The defect this pins: `settleOrdersBatch` never reverts on a rejected item, so if an
         // out-of-gas item were also treated as "rejected", eth_estimateGas would converge on the
         // cheapest gas at which EVERY item is starved and swallowed — a transaction that succeeds,
-        // emits three failure events, and settles nothing. Empty revert data now aborts the batch,
-        // so a starved run is loud.
+        // emits three failure events, and settles nothing.
         //
-        // 250k is comfortably past the loop's own overhead and nowhere near enough for three
-        // settlements, so the first item is starved rather than rejected.
+        // SSA-17 moved the line of defense earlier: 250k is far below `requiredBatchGas(3)`
+        // (~2.28M), so the batch is now refused at the door with `InsufficientBatchGas` instead of
+        // starting and starving its first item. The empty-returndata `BatchOutOfGas` abort below
+        // the guard is retained as defense in depth. Either way the property under test is the
+        // same and is the one that matters: an underfunded batch is LOUD, never a success that
+        // settled nothing.
         const before = (await settlement.read.getBalance([
           alice.account.address,
           lpToken.address,
@@ -1862,7 +1864,7 @@ describe("TradeSettlementV1 — round-2 remediation ", function () {
         await assertions.revertWithCustomError(
           settlement.write.settleOrdersBatch([items], { account: operator.account, gas: 250_000n }),
           settlement,
-          "BatchOutOfGas",
+          "InsufficientBatchGas",
         );
 
         // And nothing settled — the abort is total, not partial.

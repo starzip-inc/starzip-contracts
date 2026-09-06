@@ -15,11 +15,21 @@
  * this same scenario at gas: 450_000n revert with `BatchOutOfGas(1)`. It cannot be observed
  * against the fixed contract, so it is not encoded as a test here.
  *
+ * CertiK's 09/04 follow-up: bounding the stipend was not enough on its own, because the operator's
+ * gas figure was still whatever `eth_estimateGas` said at estimation time — a malicious ERC-1271
+ * wallet that answers cheaply during estimation and expensively during execution invalidates it.
+ * The remediation is `requiredBatchGas(n)`, a worst-case `gasleft()` floor enforced at the top of
+ * `settleOrdersBatch`, before any item runs. Below it the batch reverts, so the estimator cannot
+ * converge on a cheap-state figure at all.
+ *
  * This file:
  *   1. Asserts the POST-fix behavior: the gas-bomb item is isolated via `SettlementFailed`
  *      (`InvalidSignature`), and the honest item behind it still settles.
  *   2. Regresses a NORMAL ERC-1271 contract-wallet order still settling correctly (the stipend is
  *      not so small that a genuine `isValidSignature` gets misjudged).
+ *   3. Pins the entry guard: an underfunded batch is refused before any item runs, the same item
+ *      settles once funded, and an estimate taken BEFORE a wallet arms itself is still sufficient
+ *      after it arms.
  */
 import { describe, it } from "node:test";
 import assert from "node:assert";
@@ -55,6 +65,18 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
 
   function settlementId(seed: string): Hex {
     return keccak256(toBytes(`ssa17-${seed}`));
+  }
+
+  // SSA-17 entry guard: `settleOrdersBatch` refuses to start below `requiredBatchGas(n)`, which is
+  // a `gasleft()` floor read INSIDE the call. Every explicit gas limit in this file is therefore
+  // derived from the contract itself plus a fixed allowance for the transaction's own intrinsic
+  // and calldata cost (~55k measured for a one-item batch), never pinned to a measured total —
+  // pinning is exactly the state-dependence the guard exists to remove.
+  const TX_OVERHEAD_ALLOWANCE = 200_000n;
+  async function batchGas(settlement: any, itemCount: bigint): Promise<bigint> {
+    return (
+      ((await settlement.read.requiredBatchGas([itemCount])) as bigint) + TX_OVERHEAD_ALLOWANCE
+    );
   }
 
   const ORDER_TYPES = {
@@ -295,13 +317,15 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
         lpToken.address,
       ])) as bigint;
 
-      // Derivation: `eth_estimateGas` for this exact two-item scenario against the fixed contract
-      // measures ~410,200-410,300 gas; 450_000n is that plus ~10% margin, matching
-      // `ITEM_GAS_BUDGET`'s own convention. Kept tight on purpose so it stays a regression
-      // tripwire — see this file's header for the pre-fix mutation result at this same limit.
+      // SSA-17: the gas limit is READ FROM THE CONTRACT, not pinned to a measured figure. That
+      // is the remediation's whole point — `requiredBatchGas` is the worst case in which every
+      // item burns its full `ITEM_GAS_BUDGET`, so it is the same number whether or not the bomb
+      // wallet is burning. `+ 200_000n` covers the transaction's intrinsic and calldata cost,
+      // which is spent before `gasleft()` is ever read inside the call.
+      const required = (await settlement.read.requiredBatchGas([2n])) as bigint;
       const txHash = await settlement.write.settleOrdersBatch([[item0, item1]], {
         account: operator.account,
-        gas: 450_000n,
+        gas: required + TX_OVERHEAD_ALLOWANCE,
       });
       const receipt = await f.publicClient.waitForTransactionReceipt({ hash: txHash });
 
@@ -415,7 +439,7 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
       // operator integrating against this contract needs the same margin.
       await settlement.write.settleOrdersBatch([[item]], {
         account: operator.account,
-        gas: 900_000n,
+        gas: await batchGas(settlement, 1n),
       });
 
       const walletTokenAfter = (await settlement.read.getBalance([
@@ -439,8 +463,8 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
   // `ERC1271_GAS_STIPEND` reaches the callee under EIP-150's 63/64 rule — i.e. the batch was
   // underfunded, not the order invalid.
   // ==============================================================================================
-  describe("a gas-underfunded (but otherwise valid) ERC-1271 item is never recorded as SettlementFailed", function () {
-    it("settleOrdersBatch given just enough gas to trip InsufficientGasForSigCheck reports ItemOutOfGas, not SettlementFailed", async function () {
+  describe("a gas-underfunded batch is refused before it starts, never half-settled", function () {
+    it("settleOrdersBatch below requiredBatchGas reverts InsufficientBatchGas without running any item", async function () {
       const f = await loadFixture(deployFixture);
       const { settlement, usdt, lpToken, operator, bob, viem, chainId, expiry } = f;
       const walletOwner = privateKeyToAccount(WALLET_OWNER_KEY);
@@ -507,55 +531,31 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
         settlementId: settlementId("f1-underfunded"),
       };
 
-      // 200,000 gas is deliberately under-budgeted against ITEM_GAS_BUDGET (700,000), so
-      // `_isValidERC1271SignatureStipended` reverts `InsufficientGasForSigCheck` before ever
-      // calling the wallet. Measured: this scenario reverts with that selector for gas in
-      // [150_000, 220_000] and settles normally from 250_000 up, so 200,000 sits centrally in the
-      // failing band. Mutation evidence: narrowing `starvedFrame` back to `reason.length == 0`
-      // makes this same scenario report an ordinary `SettlementFailed` carrying the raw
-      // `InsufficientGasForSigCheck` selector (0x35773322) instead.
-      const txHash = await settlement.write.settleOrdersBatch([[item]], {
-        account: operator.account,
-        gas: 200_000n,
-      });
-      const receipt = await f.publicClient.waitForTransactionReceipt({ hash: txHash });
-
-      const settled = parseEventLogs({
-        abi: settlement.abi,
-        logs: receipt.logs,
-        eventName: "OrdersSettled",
-      });
-      assert.strictEqual(settled.length, 0, "the underfunded item must not settle");
-
-      const failures = parseEventLogs({
-        abi: settlement.abi,
-        logs: receipt.logs,
-        eventName: "SettlementFailed",
-      }) as unknown as { args: { settlementId: Hex; index: bigint; reason: Hex } }[];
-      assert.strictEqual(failures.length, 1, "exactly one SettlementFailed for the one item");
-      assert.strictEqual(failures[0].args.settlementId, item.settlementId);
-
-      // The reported reason must be `ItemOutOfGas(0)` — the SAME signal an empty-returndata OOG
-      // produces — never the raw `InsufficientGasForSigCheck` selector forwarded as if it were an
-      // ordinary rejection reason. `abi.encodeWithSelector(ItemOutOfGas.selector, 0)` is a 4-byte
-      // selector + one 32-byte word (the index), 36 bytes total.
-      const itemOutOfGasSelector = settlement.abi.find(
-        (e: any) => e.type === "error" && e.name === "ItemOutOfGas",
+      // SSA-17 entry guard: 200,000 gas used to land INSIDE the contract and trip
+      // `_isValidERC1271SignatureStipended`'s `InsufficientGasForSigCheck`, which the batch loop
+      // then had to re-label as `ItemOutOfGas` so starvation would not read as "this order was
+      // invalid". The guard makes that unreachable from here: `requiredBatchGas(1)` is 861,111,
+      // so an underfunded batch is now rejected before the first item runs and before any
+      // untrusted ERC-1271 code is reached at all. The starvation branches below the guard are
+      // retained as defense in depth.
+      const required = (await settlement.read.requiredBatchGas([1n])) as bigint;
+      assert.ok(required > 200_000n, "the guard must actually bind at this test's gas limit");
+      await assertions.revertWithCustomError(
+        settlement.write.settleOrdersBatch([[item]], {
+          account: operator.account,
+          gas: 200_000n,
+        }),
+        settlement,
+        "InsufficientBatchGas",
       );
-      assert.ok(itemOutOfGasSelector, "ABI must expose ItemOutOfGas");
-      const encodedItemOutOfGas = encodeErrorResult({
-        abi: settlement.abi,
-        errorName: "ItemOutOfGas",
-        args: [0n],
-      });
+
+      // Nothing ran: no settlement, no failure event, no balance movement, and the id stays
+      // unmarked so the item is still retryable at a correct gas limit.
       assert.strictEqual(
-        failures[0].args.reason,
-        encodedItemOutOfGas,
-        "reason must be the distinct ItemOutOfGas(0) OOG signal, never the raw " +
-          "InsufficientGasForSigCheck selector forwarded as an ordinary rejection reason — " +
-          "gas starvation must never look like 'this order was invalid'",
+        (await settlement.read.processedSettlements([item.settlementId])) as boolean,
+        false,
+        "a refused batch must not mark any settlement id",
       );
-
       const walletTokenAfter = (await settlement.read.getBalance([
         wallet.address,
         lpToken.address,
@@ -563,7 +563,174 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
       assert.strictEqual(
         walletTokenAfter,
         walletTokenBefore,
-        "no partial/silent settlement occurred for the starved item",
+        "no partial/silent settlement occurred for the refused batch",
+      );
+    });
+
+    it("the same item settles once the batch is funded to requiredBatchGas", async function () {
+      // The other half of the guard: it rejects underfunding, it does not reject the order. Same
+      // fixture, same item, gas taken from the contract instead of guessed.
+      const f = await loadFixture(deployFixture);
+      const { settlement, usdt, lpToken, operator, bob, viem, chainId, expiry } = f;
+      const walletOwner = privateKeyToAccount(WALLET_OWNER_KEY);
+
+      const wallet = await viem.deployContract("MockERC1271Wallet", [walletOwner.address]);
+      const fundAmt = parseUnits("2000", 18);
+      await usdt.write.mint([wallet.address, fundAmt]);
+      await wallet.write.execute([
+        usdt.address,
+        encodeFunctionData({
+          abi: usdt.abi,
+          functionName: "approve",
+          args: [settlement.address, fundAmt],
+        }),
+      ]);
+      await wallet.write.execute([
+        settlement.address,
+        encodeFunctionData({
+          abi: settlement.abi,
+          functionName: "depositToken",
+          args: [usdt.address, fundAmt],
+        }),
+      ]);
+
+      const buyOrder: Order = {
+        account: wallet.address,
+        baseToken: lpToken.address,
+        quoteToken: usdt.address,
+        isBuy: true,
+        baseAmount: parseUnits("100", 18),
+        quoteAmount: parseUnits("1000", 18),
+        maxFeeRate: 100n,
+        nonce: 501n,
+        expiry,
+      };
+      const sellOrder: Order = {
+        account: bob.account.address,
+        baseToken: lpToken.address,
+        quoteToken: usdt.address,
+        isBuy: false,
+        baseAmount: parseUnits("100", 18),
+        quoteAmount: parseUnits("1000", 18),
+        maxFeeRate: 100n,
+        nonce: 501n,
+        expiry,
+      };
+      const item = {
+        buyOrder,
+        buySig: await signOrder(WALLET_OWNER_KEY, buyOrder, chainId, settlement.address),
+        sellOrder,
+        sellSig: await signOrder(BOB_KEY, sellOrder, chainId, settlement.address),
+        fillBaseAmount: parseUnits("100", 18),
+        fillQuoteAmount: parseUnits("1000", 18),
+        buyerFee: 0n,
+        sellerFee: 0n,
+        settlementId: settlementId("f1-funded"),
+      };
+
+      const before = (await settlement.read.getBalance([
+        wallet.address,
+        lpToken.address,
+      ])) as bigint;
+      const required = (await settlement.read.requiredBatchGas([1n])) as bigint;
+      await settlement.write.settleOrdersBatch([[item]], {
+        account: operator.account,
+        gas: required + TX_OVERHEAD_ALLOWANCE,
+      });
+      assert.strictEqual(
+        ((await settlement.read.getBalance([wallet.address, lpToken.address])) as bigint) - before,
+        parseUnits("100", 18),
+        "a correctly funded batch settles the very item the guard refused",
+      );
+    });
+  });
+
+  // ==============================================================================================
+  // SSA-17 (CertiK 09/04 follow-up): the attack sequence itself, end to end — estimate the batch
+  // while the untrusted ERC-1271 wallet is answering cheaply, let it arm itself, then execute with
+  // that UNCHANGED estimate. The entry guard is what makes this safe: `settleOrdersBatch` reverts
+  // below `requiredBatchGas(n)`, so the estimator cannot converge on a figure that only holds
+  // while the wallet is cheap.
+  // ==============================================================================================
+  describe("SSA-17: an estimate taken before an ERC-1271 wallet arms itself is still sufficient", function () {
+    it("estimate cheap -> arm -> execute at the unchanged estimate: the honest item still settles", async function () {
+      const f = await loadFixture(deployFixture);
+      const { settlement, operator, alice, lpToken, viem, publicClient } = f;
+
+      const bomb = await viem.deployContract("ArmableGasBombERC1271Wallet", []);
+      const item0 = await buildBombItem(f, bomb.address, 700n);
+      const item1 = await buildHonestItem(f, 701n, "armable-honest");
+
+      // 1. Estimate while the wallet is cheap — precisely what a naive operator does, and what
+      //    CertiK asked to see tested.
+      const estimate = await publicClient.estimateContractGas({
+        address: settlement.address,
+        abi: settlement.abi,
+        functionName: "settleOrdersBatch",
+        args: [[item0, item1]],
+        account: operator.account,
+      });
+
+      const required = (await settlement.read.requiredBatchGas([2n])) as bigint;
+      assert.ok(
+        estimate >= required,
+        `estimate ${estimate} must be >= requiredBatchGas(2) ${required} — the entry guard is the ` +
+          "only thing stopping a cheap-state estimate from under-funding the batch",
+      );
+
+      // 2. The wallet arms itself between estimation and execution. Nothing about the operator's
+      //    already-computed gas figure changes.
+      await bomb.write.arm();
+
+      const aliceBefore = (await settlement.read.getBalance([
+        alice.account.address,
+        lpToken.address,
+      ])) as bigint;
+
+      // 3. Execute at the UNCHANGED estimate. Pre-guard, this is where the armed item ate the gas
+      //    the honest item needed, starving it into an empty-returndata revert and rolling the
+      //    whole batch back through BatchOutOfGas.
+      const txHash = await settlement.write.settleOrdersBatch([[item0, item1]], {
+        account: operator.account,
+        gas: estimate,
+      });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash: txHash });
+      assert.strictEqual(receipt.status, "success", "the batch must not revert");
+
+      const settled = parseEventLogs({
+        abi: settlement.abi,
+        logs: receipt.logs,
+        eventName: "OrdersSettled",
+      }) as unknown as { args: { settlementId: Hex } }[];
+      const failures = parseEventLogs({
+        abi: settlement.abi,
+        logs: receipt.logs,
+        eventName: "SettlementFailed",
+      }) as unknown as { args: { settlementId: Hex; index: bigint; reason: Hex } }[];
+
+      assert.strictEqual(settled.length, 1, "the honest item settled despite the armed bomb");
+      assert.strictEqual(settled[0].args.settlementId, item1.settlementId);
+      assert.strictEqual(failures.length, 1, "only the bomb item failed");
+      assert.strictEqual(failures[0].args.index, 0n);
+
+      // The failure must be an ordinary rejection, NOT a starvation signal — if the armed item
+      // could still starve its own frame past the stipend this would come back as ItemOutOfGas.
+      const encodedItemOutOfGas = encodeErrorResult({
+        abi: settlement.abi,
+        errorName: "ItemOutOfGas",
+        args: [0n],
+      });
+      assert.notStrictEqual(
+        failures[0].args.reason,
+        encodedItemOutOfGas,
+        "the armed bomb must be isolated as an invalid item, not reported as gas starvation",
+      );
+
+      assert.strictEqual(
+        ((await settlement.read.getBalance([alice.account.address, lpToken.address])) as bigint) -
+          aliceBefore,
+        parseUnits("10", 18),
+        "the honest fill actually landed under an estimate taken before the wallet armed",
       );
     });
   });
@@ -650,7 +817,7 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
       const { settlement, operator } = f;
       const txHash = await settlement.write.settleOrdersBatch([[item]], {
         account: operator.account,
-        gas: 900_000n,
+        gas: await batchGas(settlement, 1n),
       });
       const receipt = await f.publicClient.waitForTransactionReceipt({ hash: txHash });
 
@@ -677,7 +844,7 @@ describe("TradeSettlementV1 — SSA-17: bounded ERC-1271 gas in settleOrdersBatc
       const { settlement, operator } = f;
       const txHash = await settlement.write.settleOrdersBatch([[item]], {
         account: operator.account,
-        gas: 900_000n,
+        gas: await batchGas(settlement, 1n),
       });
       const receipt = await f.publicClient.waitForTransactionReceipt({ hash: txHash });
 
